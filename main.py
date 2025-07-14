@@ -291,6 +291,28 @@ class GraphRLSolver:
         self.train_history['episode_losses'] = episode_losses
         self.train_history['best_rewards'] = self.best_reward_history
         
+        # 新增: 保存训练历史到pickle文件
+        history_dir = os.path.dirname(model_save_path)
+        if not os.path.exists(history_dir):
+            os.makedirs(history_dir)
+        # 从模型保存路径中提取参数信息
+        import re
+        match = re.search(r'ep(\d+)_phrrt(True|False)', model_save_path)
+        # 添加调试信息确认参数提取
+        print(f"调试: 尝试从模型路径提取参数: {model_save_path}")
+        if match:
+            episodes = match.group(1)
+            phrrt = match.group(2)
+            print(f"调试: 提取到参数 - episodes={episodes}, phrrt={phrrt}")
+            history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{phrrt}.pkl')
+            # 确认train_history内容
+            print(f"调试: 训练历史包含键: {self.train_history.keys()}, 奖励数据点数量: {len(self.train_history.get('episode_rewards', []))}")
+            with open(history_path, 'wb') as f:
+                pickle.dump(self.train_history, f)
+            print(f"训练历史已保存至: {history_path}")
+        else:
+            print("警告: 未能从模型路径提取episodes和phrrt参数，训练历史未保存")
+        
         # 绘制并保存训练收敛图
         self._plot_convergence(model_save_path)
         
@@ -370,14 +392,43 @@ class GraphRLSolver:
     
 
     def load_model(self, path):
-        """(已修订) 从文件加载模型权重，并处理PyTorch的FutureWarning。"""
+        """(已修订) 从文件加载模型权重和训练历史，并处理PyTorch的FutureWarning。"""
         if os.path.exists(path):
             try:
-                checkpoint = torch.load(path, map_location=self.device, weights_only=False); self.model.load_state_dict(checkpoint['model_state_dict']); self.target_model.load_state_dict(self.model.state_dict()); self.optimizer.load_state_dict(checkpoint['optimizer_state_dict']); return True
+                # 加载模型权重
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.target_model.load_state_dict(self.model.state_dict())
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                model_loaded = True
             except Exception:
                 try:
-                    state_dict = torch.load(path, map_location=self.device, weights_only=True); self.model.load_state_dict(state_dict); self.target_model.load_state_dict(self.model.state_dict()); return True
-                except Exception as e: print(f"回退加载模型权重时出错: {e}"); return False
+                    state_dict = torch.load(path, map_location=self.device, weights_only=True)
+                    self.model.load_state_dict(state_dict)
+                    self.target_model.load_state_dict(self.model.state_dict())
+                    model_loaded = True
+                except Exception as e:
+                    print(f"回退加载模型权重时出错: {e}")
+                    return False
+
+            if model_loaded:
+                # 尝试加载训练历史
+                import re
+                match = re.search(r'ep_(\d+)_phrrt_(True|False)', path)
+                if match:
+                    episodes = match.group(1)
+                    phrrt = match.group(2)
+                    history_dir = os.path.dirname(path)
+                    history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{phrrt}.pkl')
+                    if os.path.exists(history_path):
+                        with open(history_path, 'rb') as f:
+                            self.train_history = pickle.load(f)
+                        print(f"调试: 已加载训练历史，奖励数据点数量: {len(self.train_history.get('episode_rewards', []))}")
+                    else:
+                        print(f"警告: 训练历史文件不存在: {history_path}")
+                else:
+                    print("警告: 无法从模型路径提取参数以加载训练历史")
+                return True
         return False
 
 

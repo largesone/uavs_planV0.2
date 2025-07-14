@@ -225,9 +225,11 @@ def run_quick_parameter_test():
         total_runtime = end_time - start_time
         
         # 使用evaluate_plan函数获取详细评估指标
-        evaluation_metrics = None
+        evaluation_metrics = {'total_reward_score': 0, 'satisfied_targets_rate': 0, 'resource_utilization_rate': 0, 'load_balance_score': 0, 'total_distance': 0}
         if final_plan:
             evaluation_metrics = evaluate_plan(final_plan, base_uavs, base_targets, deadlocked_tasks)
+            # 确保评分方式与main.py一致
+            evaluation_metrics['total_reward_score'] = evaluation_metrics.get('total_reward_score', 0)
             
             # 检测无人机分配但资源贡献为0的情况
             zero_contribution_found = False
@@ -240,7 +242,7 @@ def run_quick_parameter_test():
                                 'param_set': f"EPISODES={params['EPISODES']}, PHRRT={params['USE_PHRRT_DURING_TRAINING']}",
                                 'uav_id': uav_id,
                                 'target_id': task['target_id'],
-                                'task_details': task
+                                'task_details': {k: v for k, v in task.items() if k != 'path_points'}
                             })
             
             # 记录结果
@@ -315,7 +317,9 @@ def run_quick_parameter_test():
             print(f"  任务详情: {case['task_details']}")
     else:
         print(f"\n未检测到无人机分配但资源贡献为0的情况")
-    
+    # 导入 get_config_hash 以确保路径匹配
+    from main import get_config_hash
+    import pickle    
     # --- 可视化分析 ---
     # 1. 算法运行时间分析（单独分析，不计入总评分）
     plt.figure(figsize=(12, 6))
@@ -446,6 +450,102 @@ def run_quick_parameter_test():
     )
     plt.figtext(0.5, 0.01, score_rule, ha='center', fontsize=10, 
                 bbox={'facecolor': 'lightgray', 'alpha': 0.5, 'pad': 5})
+
+    # 新增: 训练轮次与奖励变化收敛曲线分析
+    plt.figure(figsize=(12, 8))
+    
+    # 按训练轮次和PHRRT设置分组绘制
+    for phrrt in [False, True]:
+        for ep in test_episodes:
+            # 查找对应参数组合的结果
+            subset = df[(df['EPISODES'] == ep) & (df['USE_PHRRT_DURING_TRAINING'] == phrrt)]
+            if len(subset) == 0:
+                continue
+            
+            # 构造训练历史文件路径
+            # 保持与main.py完全一致的路径结构
+            model_subdir = f'QuickTest_ep{ep}_phrrt{phrrt}'
+            # 使用主训练输出目录
+            model_dir = os.path.join('output', 'models', model_subdir)
+            # 验证模型目录是否存在
+            if not os.path.exists(model_dir):
+                print(f'错误: 模型目录不存在 - {model_dir}')
+                continue
+            # 获取配置哈希子目录
+            try:
+                config_dirs = [d for d in os.listdir(model_dir) if os.path.isdir(os.path.join(model_dir, d))]
+            except Exception as e:
+                print(f'读取配置目录失败: {str(e)}')
+                continue
+            if config_dirs and len(config_dirs) > 0:
+                config_dir = config_dirs[0]  # 取第一个配置目录
+                # 保持与main.py完全一致的命名规范
+                history_filename = f'training_history_ep_{ep}_phrrt_{phrrt}.pkl'
+                model_subdir = f'QuickTest_ep{ep}_phrrt{phrrt}'
+                history_path = os.path.join(model_dir, config_dir, history_filename)
+                print(f'调试: 尝试加载训练历史文件: {history_path}')
+            else:
+                print(f'警告: 未找到配置目录 in {model_dir}')
+                continue
+            
+            try:
+                # 读取训练历史数据
+                try:
+                    with open(history_path, 'rb') as f:
+                        train_history = pickle.load(f)
+                    # 调试: 打印训练历史内容结构
+                    print(f'调试: 训练历史文件内容键: {train_history.keys()}')
+                    episode_rewards = train_history.get('episode_rewards', [])
+                    print(f'调试: 加载到的奖励数据点数量: {len(episode_rewards)}')
+                except Exception as e:
+                    print(f'加载训练历史文件失败: {str(e)}')
+                    episode_rewards = []
+                
+                if episode_rewards:
+                    # 绘制原始奖励曲线
+                    plt.plot(episode_rewards, alpha=0.3, label=f'EP={ep}, PHRRT={phrrt} (原始)')
+                    
+                    # 绘制移动平均线
+                    window_size = min(20, len(episode_rewards))
+                    if window_size > 0:
+                        moving_avg = np.convolve(episode_rewards, np.ones(window_size)/window_size, mode='valid')
+                        plt.plot(range(window_size-1, len(episode_rewards)), moving_avg, 
+                                 label=f'EP={ep}, PHRRT={phrrt} ({window_size}轮平均)')
+                    
+                    # 添加数据范围信息用于调试
+                    print(f'EP={ep}, PHRRT={phrrt}: 奖励数据点数量={len(episode_rewards)}, '\
+                          f'最小值={np.min(episode_rewards):.2f}, 最大值={np.max(episode_rewards):.2f}, '\
+                          f'平均值={np.mean(episode_rewards):.2f}')
+            except:
+                continue
+    
+    plt.xlabel('训练迭代轮次')
+    plt.ylabel('每轮奖励值')
+    plt.title('不同训练轮次设置下的奖励收敛曲线对比')
+    
+    # 自动调整Y轴范围以显示实际奖励值
+    all_rewards = []
+    for line in plt.gca().get_lines():
+        all_rewards.extend(line.get_ydata())
+    if all_rewards:
+        y_min, y_max = min(all_rewards), max(all_rewards)
+        y_pad = (y_max - y_min) * 0.1 if y_max > y_min else 10
+        plt.ylim(y_min - y_pad, y_max + y_pad)
+    else:
+        plt.ylim(-100, 1000)  # 设置默认Y轴范围
+    
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'reward_convergence_comparison.png'), dpi=300)
+    plt.close()
+    
+    # 输出汇总调试信息
+    print(f'收敛曲线绘制完成: 共加载{len(plt.gca().get_lines())}条曲线')
+    if all_rewards:
+        print(f'奖励值范围: [{min(all_rewards):.2f}, {max(all_rewards):.2f}]')
+    else:
+        print('警告: 未加载到任何奖励数据')
     
     plt.tight_layout(rect=[0, 0.08, 1, 1])  # 为底部文本留出空间
     plt.savefig(os.path.join(output_dir, "total_reward_score_analysis.png"), dpi=300)
