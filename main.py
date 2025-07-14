@@ -141,7 +141,10 @@ class UAVTaskEnv:
     """强化学习环境：定义状态、动作、奖励和转移逻辑"""
     def __init__(self, uavs, targets, graph, obstacles, config):
         self.uavs, self.targets, self.graph, self.obstacles, self.config = uavs, targets, graph, obstacles, config
-        self.load_balance_penalty = config.LOAD_BALANCE_PENALTY; self.alliance_bonus = 10.0; self.use_phrrt_in_training = config.USE_PHRRT_DURING_TRAINING; self.reset()
+        self.load_balance_penalty = config.LOAD_BALANCE_PENALTY
+        self.alliance_bonus = 100.0  # 协作奖励大幅提升
+        self.use_phrrt_in_training = config.USE_PHRRT_DURING_TRAINING
+        self.reset()
     def reset(self):
         for uav in self.uavs: uav.reset()
         for target in self.targets: target.reset()
@@ -153,45 +156,133 @@ class UAVTaskEnv:
         return np.array(state, dtype=np.float32)
     
     def step(self, action):
-        target_id, uav_id, phi_idx = action; target = next((t for t in self.targets if t.id == target_id), None); uav = next((u for u in self.uavs if u.id == uav_id), None)
-        if not target or not uav: return self._get_state(), -100, True, {}
+        target_id, uav_id, phi_idx = action
+        target = next((t for t in self.targets if t.id == target_id), None)
+        uav = next((u for u in self.uavs if u.id == uav_id), None)
+        
+        if not target or not uav: 
+            return self._get_state(), -100, True, {}
+        
         actual_contribution = np.minimum(target.remaining_resources, uav.resources)
-        if np.all(actual_contribution <= 0): return self._get_state(), -20, False, {}
+        if np.all(actual_contribution <= 0): 
+            return self._get_state(), -20, False, {}
+        
+        # 记录目标完成前的状态
+        was_satisfied = np.all(target.remaining_resources <= 0)
+        
+        # 计算路径长度（保留原有设计）
         if self.use_phrrt_in_training:
             start_heading = uav.heading if not uav.task_sequence else self.graph.phi_set[uav.task_sequence[-1][1]]
-            planner = PHCurveRRTPlanner(uav.current_position, target.position, start_heading, self.graph.phi_set[phi_idx], self.obstacles, self.config); plan_result = planner.plan()
-            path_len = plan_result[1] if plan_result else np.linalg.norm(target.position - uav.current_position) * 10
+            planner = PHCurveRRTPlanner(uav.current_position, target.position, start_heading, self.graph.phi_set[phi_idx], self.obstacles, self.config)
+            plan_result = planner.plan()
+            path_len = plan_result[1] if plan_result else np.linalg.norm(uav.current_position - target.position)
         else:
-            start_v = (-uav.id, None) if not uav.task_sequence else (uav.task_sequence[-1][0], self.graph.phi_set[uav.task_sequence[-1][1]])
-            end_v = (target.id, self.graph.phi_set[phi_idx]); path_len = self.graph.adjacency_matrix[self.graph.vertex_to_idx[start_v], self.graph.vertex_to_idx[end_v]]
+            path_len = np.linalg.norm(uav.current_position - target.position)
         
-        # [新增] 为贡献的资源本身提供正向奖励
-        # 将贡献的两种资源相加，并乘以一个缩放因子作为奖励
-        resource_contribution_reward = np.sum(actual_contribution) * 0.1 
-
-        collaborators = {a[0] for a in target.allocated_uavs}; is_joining_alliance = len(collaborators) > 0 and uav_id not in collaborators
-        uav.resources -= actual_contribution; target.remaining_resources -= actual_contribution
-        if uav_id not in collaborators: target.allocated_uavs.append((uav_id, phi_idx))
-        travel_time = path_len / uav.velocity_range[1]; reward = -travel_time; uav.task_sequence.append((target_id, phi_idx)); uav.current_distance += path_len; uav.current_position = target.position
+        # 计算旅行时间
+        travel_time = path_len / uav.velocity_range[1]
         
-        # [修改] 将资源贡献奖励加入回报计算
-        reward += resource_contribution_reward
-
-        if np.all(target.remaining_resources <= 0): reward += 50
-        if is_joining_alliance: reward += self.alliance_bonus
-        imbalance_penalty = np.var([len(u.task_sequence) for u in self.uavs]) * self.load_balance_penalty if self.uavs else 0
-        done = all(np.all(t.remaining_resources <= 0) for t in self.targets); completion_bonus = 500 if done else 0
-        final_reward = reward - imbalance_penalty + completion_bonus
-        return self._get_state(), final_reward, done, {}
+        # 更新状态
+        uav.resources -= actual_contribution
+        target.remaining_resources -= actual_contribution
+        if uav_id not in {a[0] for a in target.allocated_uavs}:
+            target.allocated_uavs.append((uav_id, phi_idx))
+        uav.task_sequence.append((target_id, phi_idx))
+        uav.current_position = target.position
+        uav.heading = self.graph.phi_set[phi_idx]
+        
+        # 检查是否完成所有目标
+        total_satisfied = sum(np.all(t.remaining_resources <= 0) for t in self.targets)
+        total_targets = len(self.targets)
+        done = total_satisfied == total_targets
+        
+        # === 分层奖励设计：优先考虑目标数量和资源满足度 ===
+        
+        # 1. 目标完成奖励（最高优先级）
+        now_satisfied = np.all(target.remaining_resources <= 0)
+        new_satisfied = int(now_satisfied and not was_satisfied)
+        target_completion_reward = 0
+        if new_satisfied:
+            target_completion_reward = 1500  # 增加新完成目标的奖励
+        
+        # 2. 目标接近完成奖励（新增渐进奖励）
+        target_initial_total = np.sum(target.resources)
+        target_remaining_before = np.sum(target.remaining_resources + actual_contribution)
+        target_remaining_after = np.sum(target.remaining_resources)
+        completion_ratio_before = 1.0 - (target_remaining_before / target_initial_total)
+        completion_ratio_after = 1.0 - (target_remaining_after / target_initial_total)
+        completion_improvement = completion_ratio_after - completion_ratio_before
+        completion_progress_reward = completion_improvement * 800  # 增加渐进奖励权重
+        
+        # 3. 资源满足度奖励（新增）
+        resource_satisfaction_ratio = np.sum(actual_contribution) / np.sum(target.remaining_resources + actual_contribution)
+        resource_satisfaction_reward = resource_satisfaction_ratio * 200
+        
+        # 4. 协作奖励（增强）
+        collaboration_bonus = 0
+        if len(target.allocated_uavs) > 1:  # 多无人机协作
+            collaboration_bonus = self.alliance_bonus * len(target.allocated_uavs) * 0.5
+        
+        # 5. 效率奖励（新增）
+        efficiency_reward = 0
+        if travel_time > 0:
+            efficiency_reward = 100 / (travel_time + 1)  # 时间越短奖励越高
+        
+        # 6. 负载均衡奖励（轻微）
+        load_balance_reward = 0
+        if len(target.allocated_uavs) > 1:
+            uav_contributions = []
+            for uav_id, _ in target.allocated_uavs:
+                uav = next((u for u in self.uavs if u.id == uav_id), None)
+                if uav:
+                    contribution = np.sum(np.minimum(target.resources, uav.initial_resources))
+                    uav_contributions.append(contribution)
+            if uav_contributions:
+                std_contribution = np.std(uav_contributions)
+                load_balance_reward = max(0, int(50 - std_contribution))  # 贡献越均衡奖励越高
+        
+        # 7. 路径惩罚（轻微）
+        path_penalty = -travel_time * 0.1  # 轻微惩罚长路径
+        
+        # 综合奖励
+        total_reward = (
+            target_completion_reward +      # 目标完成（最高权重）
+            completion_progress_reward +    # 渐进完成
+            resource_satisfaction_reward +  # 资源满足
+            collaboration_bonus +           # 协作奖励
+            efficiency_reward +             # 效率奖励
+            load_balance_reward +           # 负载均衡
+            path_penalty                    # 路径惩罚
+        )
+        
+        return self._get_state(), total_reward, done, {}
 
 
 # =============================================================================
 # section 4: 强化学习求解器
 # =============================================================================
 class GNN(nn.Module):
-    """一个简单的全连接神经网络，用作Q值函数逼近器"""
-    def __init__(self, i_dim, h_dim, o_dim): super(GNN, self).__init__(); self.l = nn.Sequential(nn.Linear(i_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, h_dim), nn.ReLU(), nn.Linear(h_dim, o_dim))
-    def forward(self, x): return self.l(x)
+    """优化的神经网络，增加网络容量以提升学习能力"""
+    def __init__(self, i_dim, h_dim, o_dim):
+        super(GNN, self).__init__()
+        # 增加网络深度和宽度
+        self.l = nn.Sequential(
+            nn.Linear(i_dim, h_dim * 2),  # 第一层：输入维度 -> 2倍隐藏层
+            nn.ReLU(),
+            nn.Dropout(0.1),  # 添加dropout防止过拟合
+            nn.Linear(h_dim * 2, h_dim * 2),  # 第二层：保持宽度
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(h_dim * 2, h_dim),  # 第三层：逐渐减少到原始隐藏层
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(h_dim, h_dim // 2),  # 第四层：进一步减少
+            nn.ReLU(),
+            nn.Linear(h_dim // 2, o_dim)  # 输出层
+        )
+        
+    def forward(self, x):
+        return self.l(x)
 
 class GraphRLSolver:
     """使用深度Q网络（DQN）的强化学习求解器"""
@@ -295,14 +386,14 @@ class GraphRLSolver:
         history_dir = os.path.dirname(model_save_path)
         if not os.path.exists(history_dir):
             os.makedirs(history_dir)
+        
         # 从模型保存路径中提取参数信息
         import re
-        match = re.search(r'ep(\d+)_phrrt(True|False)', model_save_path)
-        # 添加调试信息确认参数提取
-        print(f"调试: 尝试从模型路径提取参数: {model_save_path}")
+        # 修改正则表达式以匹配实际的路径格式
+        match = re.search(r'steps(\d+)', model_save_path)
         if match:
             episodes = match.group(1)
-            phrrt = match.group(2)
+            phrrt = 'True' if config.USE_PHRRT_DURING_TRAINING else 'False'
             print(f"调试: 提取到参数 - episodes={episodes}, phrrt={phrrt}")
             history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{phrrt}.pkl')
             # 确认train_history内容
@@ -311,7 +402,12 @@ class GraphRLSolver:
                 pickle.dump(self.train_history, f)
             print(f"训练历史已保存至: {history_path}")
         else:
-            print("警告: 未能从模型路径提取episodes和phrrt参数，训练历史未保存")
+            print(f"警告: 未能从模型路径提取episodes参数，模型路径: {model_save_path}")
+            # 使用默认参数保存
+            history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{config.USE_PHRRT_DURING_TRAINING}.pkl')
+            with open(history_path, 'wb') as f:
+                pickle.dump(self.train_history, f)
+            print(f"训练历史已保存至: {history_path}")
         
         # 绘制并保存训练收敛图
         self._plot_convergence(model_save_path)
@@ -491,6 +587,7 @@ def calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obsta
     for uav_id, tasks in final_plan.items():
         for task in tasks:
             event_key = (task['arrival_time'], task['target_id'])
+            # 将无人机ID和任务引用存入对应的事件组
             events[event_key].append({'uav_id': uav_id, 'task_ref': task})
     
     # 按时间顺序处理事件
@@ -816,11 +913,11 @@ def run_scenario(config, base_uavs, base_targets, obstacles, scenario_name,
 
     if config.RUN_TRAINING:
         if model_loaded:
-            print(f"找到配置 {config_hash} 的已训练模型，将加载并继续训练... ({model_path})")
+            print(f"找到配置 {config_hash} 的已训练模型，将重新训练... ({model_path})")
         else:
             print(f"未找到配置 {config_hash} 的模型，开始新的训练... ({model_path})")
-            print(f"----- [阶段 1: 模型训练 ({scenario_name} @ {config_hash})] -----")
-            training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, log_interval=config.LOG_INTERVAL, model_save_path=model_path)
+        print(f"----- [阶段 1: 模型训练 ({scenario_name} @ {config_hash})] -----")
+        training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, log_interval=config.LOG_INTERVAL, model_save_path=model_path)
     elif not model_loaded:
         print(f"警告: 跳过训练，但未找到预训练模型 ({model_path})。任务分配将基于未训练的模型。")
     else:
