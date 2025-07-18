@@ -8,6 +8,8 @@ import pandas as pd
 import os
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import pickle
+import glob
 from main import Config, run_scenario
 from scenarios import get_small_scenario
 from evaluate import evaluate_plan
@@ -159,6 +161,54 @@ def generate_analysis_report(df, best_row, output_dir):
         f.write("\n".join(report_lines))
     
     return report_path
+
+def find_training_history_file(model_dir, ep, phrrt):
+    """
+    智能查找训练历史文件
+    
+    Args:
+        model_dir: 模型目录路径
+        ep: 训练轮次
+        phrrt: 是否使用PHRRT
+    
+    Returns:
+        训练历史文件路径，如果找不到则返回None
+    """
+    if not os.path.exists(model_dir):
+        return None
+    
+    # 尝试多种可能的文件名模式
+    possible_patterns = [
+        f"training_history_ep_{ep}_phrrt_{phrrt}.pkl",
+        f"training_history.pkl",
+        f"history.pkl",
+        f"ep_{ep}_phrrt_{phrrt}_history.pkl",
+        f"training_history_ep{ep}_phrrt{phrrt}.pkl"
+    ]
+    
+    # 在模型目录及其子目录中查找
+    search_dirs = [model_dir]
+    try:
+        for subdir in os.listdir(model_dir):
+            subdir_path = os.path.join(model_dir, subdir)
+            if os.path.isdir(subdir_path):
+                search_dirs.append(subdir_path)
+    except Exception:
+        pass
+    
+    for search_dir in search_dirs:
+        for pattern in possible_patterns:
+            file_path = os.path.join(search_dir, pattern)
+            if os.path.exists(file_path):
+                return file_path
+    
+    # 如果没找到，尝试查找任何.pkl文件
+    for search_dir in search_dirs:
+        pkl_files = glob.glob(os.path.join(search_dir, "*.pkl"))
+        if pkl_files:
+            return pkl_files[0]  # 返回第一个找到的pkl文件
+    
+    return None
 
 def run_quick_parameter_test():
     """
@@ -317,9 +367,7 @@ def run_quick_parameter_test():
             print(f"  任务详情: {case['task_details']}")
     else:
         print(f"\n未检测到无人机分配但资源贡献为0的情况")
-    # 导入 get_config_hash 以确保路径匹配
-    from main import get_config_hash
-    import pickle    
+    
     # --- 可视化分析 ---
     # 1. 算法运行时间分析（单独分析，不计入总评分）
     plt.figure(figsize=(12, 6))
@@ -463,61 +511,38 @@ def run_quick_parameter_test():
                 continue
             
             # 构造训练历史文件路径
-            # 保持与main.py完全一致的路径结构
             model_subdir = f'QuickTest_ep{ep}_phrrt{phrrt}'
-            # 使用主训练输出目录
             model_dir = os.path.join('output', 'models', model_subdir)
-            # 验证模型目录是否存在
-            if not os.path.exists(model_dir):
-                print(f'错误: 模型目录不存在 - {model_dir}')
-                continue
-            # 获取配置哈希子目录
-            try:
-                config_dirs = [d for d in os.listdir(model_dir) if os.path.isdir(os.path.join(model_dir, d))]
-            except Exception as e:
-                print(f'读取配置目录失败: {str(e)}')
-                continue
-            if config_dirs and len(config_dirs) > 0:
-                config_dir = config_dirs[0]  # 取第一个配置目录
-                # 保持与main.py完全一致的命名规范
-                history_filename = f'training_history_ep_{ep}_phrrt_{phrrt}.pkl'
-                model_subdir = f'QuickTest_ep{ep}_phrrt{phrrt}'
-                history_path = os.path.join(model_dir, config_dir, history_filename)
-                print(f'调试: 尝试加载训练历史文件: {history_path}')
-            else:
-                print(f'警告: 未找到配置目录 in {model_dir}')
-                continue
             
-            try:
-                # 读取训练历史数据
+            # 使用智能查找函数
+            history_path = find_training_history_file(model_dir, ep, phrrt)
+            
+            if history_path and os.path.exists(history_path):
                 try:
                     with open(history_path, 'rb') as f:
                         train_history = pickle.load(f)
-                    # 调试: 打印训练历史内容结构
-                    print(f'调试: 训练历史文件内容键: {train_history.keys()}')
+                    
                     episode_rewards = train_history.get('episode_rewards', [])
-                    print(f'调试: 加载到的奖励数据点数量: {len(episode_rewards)}')
+                    
+                    if episode_rewards:
+                        # 绘制原始奖励曲线
+                        plt.plot(episode_rewards, alpha=0.3, label=f'EP={ep}, PHRRT={phrrt} (原始)')
+                        
+                        # 绘制移动平均线
+                        window_size = min(20, len(episode_rewards))
+                        if window_size > 0:
+                            moving_avg = np.convolve(episode_rewards, np.ones(window_size)/window_size, mode='valid')
+                            plt.plot(range(window_size-1, len(episode_rewards)), moving_avg, 
+                                     label=f'EP={ep}, PHRRT={phrrt} ({window_size}轮平均)')
+                        
+                        print(f'EP={ep}, PHRRT={phrrt}: 奖励数据点数量={len(episode_rewards)}, '\
+                              f'最小值={np.min(episode_rewards):.2f}, 最大值={np.max(episode_rewards):.2f}, '\
+                              f'平均值={np.mean(episode_rewards):.2f}')
                 except Exception as e:
                     print(f'加载训练历史文件失败: {str(e)}')
-                    episode_rewards = []
-                
-                if episode_rewards:
-                    # 绘制原始奖励曲线
-                    plt.plot(episode_rewards, alpha=0.3, label=f'EP={ep}, PHRRT={phrrt} (原始)')
-                    
-                    # 绘制移动平均线
-                    window_size = min(20, len(episode_rewards))
-                    if window_size > 0:
-                        moving_avg = np.convolve(episode_rewards, np.ones(window_size)/window_size, mode='valid')
-                        plt.plot(range(window_size-1, len(episode_rewards)), moving_avg, 
-                                 label=f'EP={ep}, PHRRT={phrrt} ({window_size}轮平均)')
-                    
-                    # 添加数据范围信息用于调试
-                    print(f'EP={ep}, PHRRT={phrrt}: 奖励数据点数量={len(episode_rewards)}, '\
-                          f'最小值={np.min(episode_rewards):.2f}, 最大值={np.max(episode_rewards):.2f}, '\
-                          f'平均值={np.mean(episode_rewards):.2f}')
-            except:
-                continue
+                    continue
+            else:
+                print(f'未找到训练历史文件: EP={ep}, PHRRT={phrrt}')
     
     plt.xlabel('训练迭代轮次')
     plt.ylabel('每轮奖励值')

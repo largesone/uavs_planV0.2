@@ -374,7 +374,7 @@ class TrainingConvergenceAnalyzer:
 def main():
     """主函数"""
     # 示例用法
-    model_dir = r"output\models\预置场景（有障碍）\lr0.001_g0.98_eps0.05-0.999_upd10_bs128_phi6_phrrt0_steps1000"
+    model_dir = r"output\models\最复杂场景（10UAV-5目标-资源充足）\lr0.001_g0.98_eps0.05-0.999_upd10_bs128_phi6_phrrt0_steps1000"
     if not os.path.exists(model_dir):
         print(f"模型目录不存在: {model_dir}")
         print("请修改model_dir为实际的模型目录路径")

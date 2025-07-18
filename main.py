@@ -11,7 +11,7 @@ import os
 import time
 import pickle
 import random
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Optional
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -20,7 +20,7 @@ import torch.optim as optim
 # --- 本地模块导入 ---
 from entities import UAV, Target
 from path_planning import PHCurveRRTPlanner
-from scenarios import get_small_scenario, get_complex_scenario, get_new_experimental_scenario
+from scenarios import get_small_scenario, get_complex_scenario, get_new_experimental_scenario, get_complex_scenario_v4
 from config import Config
 from evaluate import evaluate_plan
 
@@ -620,6 +620,65 @@ def calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obsta
 # [新增] 从批处理测试器导入评估函数，用于对单个方案进行性能评估
 from evaluate import evaluate_plan
 
+def calibrate_resource_assignments(task_assignments, uavs, targets):
+    """
+    校准资源分配，移除无效的任务分配。
+    
+    Args:
+        task_assignments: 原始任务分配
+        uavs: 无人机列表
+        targets: 目标列表
+    
+    Returns:
+        校准后的任务分配
+    """
+    print("正在校准资源分配...")
+    
+    # 创建资源状态副本
+    uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
+    target_needs = {t.id: t.resources.copy().astype(float) for t in targets}
+    
+    # 按时间顺序处理任务分配（这里简化处理，按无人机ID顺序）
+    calibrated_assignments = {u.id: [] for u in uavs}
+    
+    for uav_id in sorted(task_assignments.keys()):
+        uav_tasks = task_assignments[uav_id]
+        for target_id, phi_idx in uav_tasks:
+            # 检查目标是否还需要资源
+            if not np.any(target_needs[target_id] > 1e-6):
+                print(f"警告: UAV {uav_id} 被分配到已满足的目标 {target_id}，跳过此分配")
+                continue
+            
+            # 检查无人机是否还有资源
+            if not np.any(uav_resources[uav_id] > 1e-6):
+                print(f"警告: UAV {uav_id} 资源已耗尽，跳过后续分配")
+                break
+            
+            # 计算实际贡献
+            contribution = np.minimum(uav_resources[uav_id], target_needs[target_id])
+            
+            # 只有当有实际贡献时才保留此分配
+            if np.any(contribution > 1e-6):
+                calibrated_assignments[uav_id].append((target_id, phi_idx))
+                uav_resources[uav_id] -= contribution
+                target_needs[target_id] -= contribution
+                print(f"UAV {uav_id} -> 目标 {target_id}: 贡献 {contribution}")
+            else:
+                print(f"警告: UAV {uav_id} 对目标 {target_id} 无有效贡献，跳过此分配")
+    
+    # 统计校准结果
+    original_count = sum(len(tasks) for tasks in task_assignments.values())
+    calibrated_count = sum(len(tasks) for tasks in calibrated_assignments.values())
+    removed_count = original_count - calibrated_count
+    
+    print(f"资源分配校准完成:")
+    print(f"  原始分配数量: {original_count}")
+    print(f"  校准后数量: {calibrated_count}")
+    print(f"  移除无效分配: {removed_count}")
+    
+    return calibrated_assignments
+
+
 def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, scenario_name, training_time, plan_generation_time,
                              save_plot=True, show_plot=False, save_report=False, deadlocked_tasks=None, evaluation_metrics=None):
     """(已更新并修复资源计算bug) 可视化任务分配方案。"""
@@ -884,11 +943,59 @@ def get_config_hash(config):
         f"steps{config.EPISODES}"
     )
 
+def _find_latest_checkpoint(model_path: str) -> Optional[str]:
+    """查找最新的检查点文件"""
+    model_dir = os.path.dirname(model_path)
+    if not os.path.exists(model_dir):
+        return None
+    
+    checkpoint_files = []
+    for file in os.listdir(model_dir):
+        if file.startswith('model_checkpoint_ep_') and file.endswith('.pth'):
+            checkpoint_files.append(os.path.join(model_dir, file))
+    
+    if not checkpoint_files:
+        return None
+    
+    # 按文件名中的轮次数排序
+    checkpoint_files.sort(key=lambda x: int(x.split('_ep_')[1].split('.')[0]))
+    return checkpoint_files[-1] if checkpoint_files else None
+
+def _get_trained_episodes(model_path: str) -> int:
+    """获取已训练的轮次数"""
+    try:
+        # 尝试从训练历史文件中获取
+        history_dir = os.path.dirname(model_path)
+        history_files = [f for f in os.listdir(history_dir) if f.startswith('training_history_')]
+        
+        if history_files:
+            # 从最新的历史文件中提取轮次数
+            latest_history = max(history_files, key=lambda x: os.path.getmtime(os.path.join(history_dir, x)))
+            with open(os.path.join(history_dir, latest_history), 'rb') as f:
+                import pickle
+                history = pickle.load(f)
+                return len(history.get('episode_rewards', []))
+        
+        # 如果无法从历史文件获取，尝试从检查点文件名获取
+        checkpoint_path = _find_latest_checkpoint(model_path)
+        if checkpoint_path:
+            episode_str = checkpoint_path.split('_ep_')[1].split('.')[0]
+            return int(episode_str)
+        
+        return 0
+    except Exception as e:
+        print(f"获取已训练轮次数时出错: {e}")
+        return 0
+
 def run_scenario(config, base_uavs, base_targets, obstacles, scenario_name, 
-                 save_visualization=True, show_visualization=True, save_report=False):
+                 save_visualization=True, show_visualization=True, save_report=False,
+                 force_retrain=False, incremental_training=False):
     """
-    (已重构) 运行一个完整的场景测试，根据场景和配置参数动态加载/保存模型。
-    此版本修复了在生成方案前重复加载模型的逻辑问题。
+    (已重构) 运行一个完整的场景测试，支持增量训练和自适应训练。
+    
+    Args:
+        force_retrain: 强制重新训练，忽略已存在的模型
+        incremental_training: 增量训练模式，在现有模型基础上继续训练
     """
     config_hash = get_config_hash(config)
     model_path = os.path.join('output', 'models', scenario_name.replace(' ', '_'), config_hash, 'model.pth')
@@ -905,19 +1012,57 @@ def run_scenario(config, base_uavs, base_targets, obstacles, scenario_name,
     graph = DirectedGraph(uavs, targets, n_phi=config.GRAPH_N_PHI)
     i_dim = len(UAVTaskEnv(uavs, targets, graph, obstacles, config).reset())
     o_dim = len(targets) * len(uavs) * graph.n_phi
-    solver = GraphRLSolver(uavs, targets, graph, obstacles, i_dim, 256, o_dim, config)
+    
+    # 检查是否使用自适应训练系统
+    use_adaptive_training = hasattr(config, 'USE_ADAPTIVE_TRAINING') and config.USE_ADAPTIVE_TRAINING
+    
+    if use_adaptive_training:
+        from temp_code.adaptive_training_system import AdaptiveGraphRLSolver
+        solver = AdaptiveGraphRLSolver(uavs, targets, graph, obstacles, i_dim, 256, o_dim, config)
+    else:
+        solver = GraphRLSolver(uavs, targets, graph, obstacles, i_dim, 256, o_dim, config)
+    
     training_time = 0.0
     
-    # 检查模型是否存在
-    model_loaded = solver.load_model(model_path)
-
+    # 智能模型加载逻辑
+    model_loaded = False
+    checkpoint_path = None
+    
+    if not force_retrain:
+        # 尝试加载完整模型
+        model_loaded = solver.load_model(model_path)
+        
+        if not model_loaded and incremental_training:
+            # 尝试找到最新的检查点
+            checkpoint_path = _find_latest_checkpoint(model_path)
+            if checkpoint_path:
+                print(f"找到检查点: {checkpoint_path}")
+                if hasattr(solver, '_load_checkpoint'):
+                    solver._load_checkpoint(checkpoint_path)
+                    model_loaded = True
+                    print(f"从检查点恢复训练")
+    
+    # 训练决策逻辑
     if config.RUN_TRAINING:
-        if model_loaded:
-            print(f"找到配置 {config_hash} 的已训练模型，将重新训练... ({model_path})")
+        if model_loaded and not force_retrain:
+            if incremental_training:
+                print(f"找到已训练模型，将进行增量训练... ({model_path})")
+                # 增量训练：在现有基础上增加训练轮次
+                additional_episodes = config.EPISODES - _get_trained_episodes(model_path)
+                if additional_episodes > 0:
+                    print(f"将在现有基础上增加 {additional_episodes} 轮训练")
+                    training_time = solver.train(episodes=additional_episodes, patience=config.PATIENCE, 
+                                               log_interval=config.LOG_INTERVAL, model_save_path=model_path)
+                else:
+                    print("模型已训练完成，无需额外训练")
+            else:
+                print(f"找到已训练模型，将重新训练... ({model_path})")
+                training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, 
+                                           log_interval=config.LOG_INTERVAL, model_save_path=model_path)
         else:
-            print(f"未找到配置 {config_hash} 的模型，开始新的训练... ({model_path})")
-        print(f"----- [阶段 1: 模型训练 ({scenario_name} @ {config_hash})] -----")
-        training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, log_interval=config.LOG_INTERVAL, model_save_path=model_path)
+            print(f"开始新的训练... ({model_path})")
+            training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, 
+                                       log_interval=config.LOG_INTERVAL, model_save_path=model_path)
     elif not model_loaded:
         print(f"警告: 跳过训练，但未找到预训练模型 ({model_path})。任务分配将基于未训练的模型。")
     else:
@@ -927,6 +1072,10 @@ def run_scenario(config, base_uavs, base_targets, obstacles, scenario_name,
     # [已修订] 移除多余的二次加载逻辑。此时solver中的模型已是最新状态（刚训练的或已加载的）。
     task_assignments = solver.get_task_assignments()
     print("获取的任务分配方案:", {k:v for k,v in task_assignments.items() if v})
+    
+    # [新增] 校准资源分配，移除无效分配
+    task_assignments = calibrate_resource_assignments(task_assignments, uavs, targets)
+    print("校准后的任务分配方案:", {k:v for k,v in task_assignments.items() if v})
     
     plan_generation_start_time = time.time()
     final_plan, deadlocked_tasks = calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obstacles, config)
@@ -977,32 +1126,38 @@ def main():
     """主函数，用于单独运行和调试一个默认场景。"""
     set_chinese_font(manual_font_path='C:/Windows/Fonts/simhei.ttf')
     config = Config()
-        
     
-    # 从scenarios模块加载预置场景数据
-    small_uavs, small_targets, small_obstacles = get_small_scenario(config.OBSTACLE_TOLERANCE)
-    #small_uavs, small_targets, small_obstacles = get_new_experimental_scenario(config.OBSTACLE_TOLERANCE)   
-
+    # 测试自适应训练系统
+    config.USE_ADAPTIVE_TRAINING = True  # 启用自适应训练
+    config.RUN_TRAINING = True  # 启用训练
+    
+    # 从scenarios模块加载最复杂的场景数据
+    complex_uavs, complex_targets, complex_obstacles = get_complex_scenario_v4(config.OBSTACLE_TOLERANCE)
+    
     print("\n" + "="*80)
-    print(">>> 正在执行默认的预置场景测试 <<<")
+    print(">>> 测试自适应训练系统 <<<")
     print("="*80)
-    config.USE_PHRRT_DURING_PLANNING = False # 近似距离算法    
-    run_scenario(config, small_uavs, small_targets, small_obstacles, "预置场景（有障碍）", show_visualization=False,save_report=True)
     
-    # config.USE_PHRRT_DURING_TRAINING = True # 训练时使用PH-RRT算法
-    # run_scenario(config, small_uavs, small_targets, small_obstacles, "预置场景（有障碍）",show_visualization=False, save_report=True)
-
-
-    # 从scenarios模块加载大规模复杂场景数据
-    # complex_uavs, complex_targets, complex_obstacles = get_complex_scenario(config.OBSTACLE_TOLERANCE)
+    # 测试1: 基础训练
+    print("\n--- 测试1: 基础训练 (500轮) ---")
+    config.EPISODES = 500
+    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
+                "自适应训练测试-基础", show_visualization=False, save_report=True)
     
-    # print("\n" + "="*80)
-    # print(">>> 正在执行默认的大规模复杂场景测试 <<<")
-    # print("="*80)
-    # 取消下面一行的注释以运行大规模场景
-    # run_scenario(config, complex_uavs, complex_targets, complex_obstacles, "大规模复杂场景（有障碍）", save_report=True)
+    # 测试2: 增量训练
+    print("\n--- 测试2: 增量训练 (增加到1000轮) ---")
+    config.EPISODES = 1000
+    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
+                "自适应训练测试-增量", show_visualization=False, save_report=True,
+                incremental_training=True)
+    
+    # 测试3: 强制重新训练
+    print("\n--- 测试3: 强制重新训练 (1000轮) ---")
+    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
+                "自适应训练测试-强制重训", show_visualization=False, save_report=True,
+                force_retrain=True)
 
-    print("\n===== [调试运行结束] =====")
+    print("\n===== [自适应训练测试完成] =====")
 
 if __name__ == "__main__":
     main()

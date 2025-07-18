@@ -68,7 +68,22 @@ class GraphRLSolver:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=config.LEARNING_RATE)
         self.memory = ReplayBuffer(config.MEMORY_CAPACITY)
         self.epsilon = config.EPSILON_START
+        
+        # 添加动作映射
+        self.target_id_map = {t.id: i for i, t in enumerate(self.env.targets)}
+        self.uav_id_map = {u.id: i for i, u in enumerate(self.env.uavs)}
 
+    def _action_to_index(self, a):
+        """将动作转换为索引"""
+        t_idx, u_idx, p_idx = self.target_id_map[a[0]], self.uav_id_map[a[1]], a[2]
+        return t_idx * (len(self.env.uavs) * self.graph.n_phi) + u_idx * self.graph.n_phi + p_idx
+    
+    def _index_to_action(self, i):
+        """将索引转换为动作"""
+        n_u, n_p = len(self.env.uavs), self.graph.n_phi
+        t_idx, u_idx, p_idx = i // (n_u * n_p), (i % (n_u * n_p)) // n_p, i % n_p
+        return (self.env.targets[t_idx].id, self.env.uavs[u_idx].id, p_idx)
+    
     def select_action(self, state):
         """使用Epsilon-Greedy策略选择动作"""
         if random.random() < self.epsilon:
@@ -151,19 +166,23 @@ class GraphRLSolver:
         return training_time
 
     def get_task_assignments(self):
-        self.model.eval(); state = self.env.reset(); assignments = {u.id: [] for u in self.env.uavs}; done, step = False, 0
+        self.policy_net.eval()
+        state = self.env.reset()
+        assignments = {u.id: [] for u in self.env.uavs}
+        done, step = False, 0
+        
         while not done and step < len(self.env.targets) * len(self.env.uavs):
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                q_values = self.model(state_tensor)
+                q_values = self.policy_net(state_tensor)
             action_idx = self.select_action(q_values)
             action = self._index_to_action(action_idx)
             target_id, uav_id, _ = action
-            uav = self.env.uavs[uav_id -1]
-            target = self.env.targets[target_id-1]
+            uav = self.env.uavs[uav_id - 1]
+            target = self.env.targets[target_id - 1]
 
             # [新增] 如果无人机资源已耗尽，则不给它分配新任务
-            if np.all(uav.remaining_resources <= 0):
+            if np.all(uav.resources <= 0):
                 step += 1
                 continue
 
@@ -173,13 +192,15 @@ class GraphRLSolver:
                 continue
 
             # [新增] 计算并记录实际资源消耗
-            contribution = np.minimum(uav.remaining_resources, target.remaining_resources)
-            assignments[uav_id].append({'target_id': target_id, 'resource_cost': contribution})
+            contribution = np.minimum(uav.resources, target.remaining_resources)
+            if np.any(contribution > 0):  # 只有当有实际贡献时才分配任务
+                assignments[uav_id].append((target_id, action[2]))  # 使用元组格式与main.py一致
 
-            state, _, done, _ = self.env.step(action) # env.step需要同步更新内部状态
+            state, _, done = self.env.step(action) # env.step需要同步更新内部状态
 
             step += 1
-        self.model.train(); return assignments
+        self.policy_net.train()
+        return assignments
         
     def save_model(self, path):
         """(已修订) 保存模型，并确保目录存在"""
