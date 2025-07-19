@@ -6,17 +6,30 @@ class Config:
     """集中管理所有算法和模拟的参数（非训练相关）"""
     
     # ----- 训练系统控制参数 -----
-    RUN_TRAINING = False                         # 启用训练模式，让模型学习新的奖励函数
-    USE_ADAPTIVE_TRAINING = True               # 是否使用自适应训练系统
+    RUN_TRAINING = False                         # 让模型学习新的奖励函数，True启用训练模式，False使用已训练好的模型
+    USE_ADAPTIVE_TRAINING = True               # 是否使用自适应训练系统，True启用，False关闭
     USE_PHRRT_DURING_TRAINING = True          # 训练时是否使用高精度PH-RRT计算距离
     USE_PHRRT_DURING_PLANNING = True          # 规划时是否使用高精度PH-RRT计算距离
-    CLEAR_MODEL_CACHE_BEFORE_TRAINING = True   # 支持增量训练，不清空模型缓存
+    CLEAR_MODEL_CACHE_BEFORE_TRAINING = True   # 支持增量训练，不清空模型缓存,True不清空，False清空
     SAVED_MODEL_PATH = 'output/models/saved_model_final_efficient.pth' # 模型保存/加载路径
 
-    # ----- 路径规划参数 -----
-    RRT_ITERATIONS = 1500      # RRT算法的最大迭代次数
-    RRT_STEP_SIZE = 75.0       # RRT树扩展的步长
-    MAX_REFINEMENT_ATTEMPTS = 15 # PH曲线路径平滑的最大尝试次数
+    # ----- RL推理优化参数 -----
+    RL_N_INFERENCE_RUNS = 10                   # RL推理时的多次推理次数
+    RL_INFERENCE_TEMPERATURE = 0.1             # RL推理时的温度参数，控制探索性
+    RL_ENSEMBLE_SIZE = 3                       # RL集成学习的大小
+    RL_USE_ENSEMBLE = True                     # 是否使用集成学习
+
+    # ===== RRT路径规划参数 =====
+    RRT_ITERATIONS = 1000          # RRT迭代次数
+    RRT_STEP_SIZE = 50.0           # RRT步长
+    RRT_GOAL_BIAS = 0.1            # 目标偏向概率
+    RRT_ADAPTIVE_STEP = True       # 是否使用自适应步长
+    RRT_OBSTACLE_AWARE = True      # 是否使用障碍物感知采样
+    RRT_MAX_ATTEMPTS = 3           # 最大尝试次数
+    
+    # ===== PH曲线平滑参数 =====
+    MAX_REFINEMENT_ATTEMPTS = 5    # 最大细化尝试次数
+    BEZIER_SAMPLES = 50            # 贝塞尔曲线采样点数
     OBSTACLE_TOLERANCE = 50.0  # 障碍物的安全容忍距离
 
     # ----- 图构建参数 -----
@@ -37,6 +50,8 @@ class Config:
     GAMMA = 0.98               # 折扣因子
     BATCH_SIZE = 128           # 批次大小
     MEMORY_SIZE = 20000        # 记忆库大小
+    MEMORY_CAPACITY = 20000    # 经验回放池容量
+    TARGET_UPDATE_INTERVAL = 10 # 目标网络更新间隔
     
     # 探索策略参数
     EPSILON_START = 1.0         # 初始探索率

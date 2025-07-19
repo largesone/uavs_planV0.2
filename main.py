@@ -16,16 +16,23 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import sys
 
 # --- 本地模块导入 ---
 from entities import UAV, Target
 from path_planning import PHCurveRRTPlanner
-from scenarios import get_small_scenario, get_complex_scenario, get_new_experimental_scenario, get_complex_scenario_v4
+from scenarios import get_small_scenario, get_complex_scenario, get_new_experimental_scenario, get_complex_scenario_v4, get_strategic_trap_scenario
 from config import Config
 from evaluate import evaluate_plan
 
 # 允许多个OpenMP库共存，解决某些环境下的冲突问题
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+# 设置控制台输出编码
+if sys.platform.startswith('win'):
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
 
 # 初始化配置类
 config = Config()
@@ -47,17 +54,28 @@ def set_chinese_font(preferred_fonts=None, manual_font_path=None):
     if manual_font_path and os.path.exists(manual_font_path):
         try:
             font_prop = FontProperties(fname=manual_font_path)
-            plt.rcParams['font.family'] = font_prop.get_name(); plt.rcParams['axes.unicode_minus'] = False
-            print(f"成功加载手动指定的字体: {manual_font_path}"); return True
-        except Exception as e: print(f"加载手动指定字体失败: {e}")
-    if preferred_fonts is None: preferred_fonts = ['Source Han Sans SC', 'SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'KaiTi', 'FangSong']
+            plt.rcParams['font.family'] = font_prop.get_name()
+            plt.rcParams['axes.unicode_minus'] = False
+            print(f"成功加载手动指定的字体: {manual_font_path}")
+            return True
+        except Exception as e:
+            print(f"加载手动指定字体失败: {e}")
+    
+    if preferred_fonts is None:
+        preferred_fonts = ['Source Han Sans SC', 'SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'KaiTi', 'FangSong']
+    
     try:
         for font in preferred_fonts:
             if findfont(FontProperties(family=font)):
-                plt.rcParams["font.family"] = font; plt.rcParams['axes.unicode_minus'] = False
-                print(f"已自动设置中文字体为: {font}"); return True
-    except Exception: pass
-    print("警告: 自动或手动设置中文字体失败。图片中的中文可能显示为方框。"); return False
+                plt.rcParams["font.family"] = font
+                plt.rcParams['axes.unicode_minus'] = False
+                print(f"已自动设置中文字体为: {font}")
+                return True
+    except Exception:
+        pass
+    
+    print("警告: 自动或手动设置中文字体失败。图片中的中文可能显示为方框。")
+    return False
 
 # 文件名: main.py
 # ... (main.py 文件其他部分无改动) ...
@@ -291,10 +309,51 @@ class GraphRLSolver:
         self.model = GNN(i_dim, h_dim, o_dim).to(self.device); self.target_model = GNN(i_dim, h_dim, o_dim).to(self.device); self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.LEARNING_RATE); self.memory = deque(maxlen=config.MEMORY_SIZE); self.epsilon, self.step_count = 1.0, 0; self.train_history = defaultdict(list)
         self.target_id_map = {t.id: i for i, t in enumerate(self.env.targets)}; self.uav_id_map = {u.id: i for i, u in enumerate(self.env.uavs)}
-        # 新增：用于检测早熟问题的变量
-        self.best_reward_history = []
-        self.loss_history = []
+        
+        # === 自适应多维闭环早熟检测系统 ===
         self.early_stop_detected = False
+        self.early_stop_counter = 0
+        self.intervention_applied = False
+        
+        # 多维度监控指标
+        self.reward_history = []
+        self.loss_history = []
+        self.gradient_norm_history = []
+        self.epsilon_history = []
+        self.exploration_rate_history = []
+        
+        # 自适应检测参数
+        self.detection_window = 50  # 检测窗口大小
+        self.min_episodes_before_detection = 100  # 开始检测的最小轮次
+        self.improvement_threshold = 0.01  # 改进阈值（1%）
+        self.stability_threshold = 0.05  # 稳定性阈值（5%）
+        
+        # 早熟干预参数
+        self.intervention_epsilon_boost = 0.3  # 探索率提升
+        self.intervention_lr_reduction = 0.5  # 学习率降低
+        self.intervention_memory_refresh = 0.3  # 记忆库刷新比例
+        self.max_interventions = 3  # 最大干预次数
+        
+        # 自适应调整参数
+        self.adaptive_detection_enabled = True
+        self.adaptive_window_adjustment = True
+        self.adaptive_threshold_adjustment = True
+        
+        # 性能基准
+        self.best_reward = -float('inf')
+        self.best_loss = float('inf')
+        self.reward_plateau_count = 0
+        self.loss_plateau_count = 0
+        
+        # 训练历史记录
+        self.best_reward_history = []
+        self.training_metrics = {
+            'episode_rewards': [],
+            'episode_losses': [],
+            'gradient_norms': [],
+            'exploration_rates': [],
+            'intervention_history': []
+        }
     def _action_to_index(self, a):
         t_idx, u_idx, p_idx = self.target_id_map[a[0]], self.uav_id_map[a[1]], a[2]; return t_idx * (len(self.env.uavs) * self.graph.n_phi) + u_idx * self.graph.n_phi + p_idx
     def _index_to_action(self, i):
@@ -323,168 +382,568 @@ class GraphRLSolver:
                 if np.any((u.resources > 0) & (t.remaining_resources > 0)):
                     start_idx = t_idx * (n_u * n_p) + u_idx * n_p; mask[start_idx: start_idx + n_p] = True
         return mask
+    def _calculate_gradient_norm(self):
+        """计算当前梯度的范数"""
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+    
+    def _detect_early_stopping(self, episode, avg_reward, avg_loss):
+        """自适应多维闭环早熟检测"""
+        if episode < self.min_episodes_before_detection:
+            return False, {}
+        
+        # 更新历史记录
+        self.reward_history.append(avg_reward)
+        self.loss_history.append(avg_loss)
+        self.epsilon_history.append(self.epsilon)
+        
+        # 计算梯度范数
+        if len(self.reward_history) > 1:
+            grad_norm = self._calculate_gradient_norm()
+            self.gradient_norm_history.append(grad_norm)
+        
+        # 自适应调整检测窗口
+        if self.adaptive_window_adjustment and episode > 200:
+            # 根据训练进度动态调整窗口大小
+            progress_ratio = episode / self.config.EPISODES
+            self.detection_window = max(30, min(100, int(50 * (1 + progress_ratio))))
+        
+        # 自适应调整阈值
+        if self.adaptive_threshold_adjustment and episode > 150:
+            # 根据训练进度动态调整阈值
+            progress_ratio = episode / self.config.EPISODES
+            self.improvement_threshold = max(0.005, min(0.02, 0.01 * (1 + progress_ratio)))
+            self.stability_threshold = max(0.03, min(0.08, 0.05 * (1 + progress_ratio)))
+        
+        # 多维度检测指标
+        detection_results = {
+            'reward_plateau': False,
+            'loss_plateau': False,
+            'gradient_stagnation': False,
+            'exploration_deficiency': False,
+            'overall_stagnation': False
+        }
+        
+        # 1. 奖励停滞检测
+        if len(self.reward_history) >= self.detection_window:
+            recent_rewards = self.reward_history[-self.detection_window:]
+            recent_max = max(recent_rewards)
+            if recent_max <= self.best_reward * (1 + self.improvement_threshold):
+                detection_results['reward_plateau'] = True
+                self.reward_plateau_count += 1
+            else:
+                self.reward_plateau_count = 0
+        
+        # 2. 损失停滞检测
+        if len(self.loss_history) >= self.detection_window:
+            recent_losses = self.loss_history[-self.detection_window:]
+            recent_min = min(recent_losses)
+            if recent_min >= self.best_loss * (1 - self.improvement_threshold):
+                detection_results['loss_plateau'] = True
+                self.loss_plateau_count += 1
+            else:
+                self.loss_plateau_count = 0
+        
+        # 3. 梯度停滞检测
+        if len(self.gradient_norm_history) >= self.detection_window:
+            recent_grads = self.gradient_norm_history[-self.detection_window:]
+            grad_std = np.std(recent_grads)
+            grad_mean = np.mean(recent_grads)
+            if grad_std < grad_mean * self.stability_threshold:
+                detection_results['gradient_stagnation'] = True
+        
+        # 4. 探索不足检测
+        if len(self.epsilon_history) >= self.detection_window:
+            recent_epsilon = self.epsilon_history[-self.detection_window:]
+            epsilon_std = np.std(recent_epsilon)
+            if epsilon_std < 0.01:  # 探索率变化很小
+                detection_results['exploration_deficiency'] = True
+        
+        # 5. 综合停滞检测
+        stagnation_count = sum(detection_results.values())
+        if stagnation_count >= 2:  # 至少两个维度出现停滞
+            detection_results['overall_stagnation'] = True
+        
+        # 判断是否需要干预
+        needs_intervention = (
+            detection_results['overall_stagnation'] or
+            self.reward_plateau_count >= 3 or
+            self.loss_plateau_count >= 3
+        )
+        
+        return needs_intervention, detection_results
+    
+    def _apply_early_stopping_intervention(self, detection_results):
+        """应用早熟干预措施"""
+        if self.intervention_applied or len(self.training_metrics['intervention_history']) >= self.max_interventions:
+            return False
+        
+        print(f"\n=== 检测到早熟问题，应用干预措施 ===")
+        print(f"检测结果: {detection_results}")
+        
+        # 1. 提升探索率
+        old_epsilon = self.epsilon
+        self.epsilon = min(1.0, self.epsilon + self.intervention_epsilon_boost)
+        print(f"探索率提升: {old_epsilon:.3f} -> {self.epsilon:.3f}")
+        
+        # 2. 降低学习率
+        old_lr = self.optimizer.param_groups[0]['lr']
+        new_lr = old_lr * self.intervention_lr_reduction
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        print(f"学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
+        
+        # 3. 刷新记忆库（部分）
+        if len(self.memory) > 0:
+            refresh_size = int(len(self.memory) * self.intervention_memory_refresh)
+            for _ in range(refresh_size):
+                if len(self.memory) > 0:
+                    self.memory.popleft()
+            print(f"记忆库刷新: 移除 {refresh_size} 个旧经验")
+        
+        # 4. 重置停滞计数器
+        self.reward_plateau_count = 0
+        self.loss_plateau_count = 0
+        
+        # 5. 记录干预历史
+        intervention_record = {
+            'episode': len(self.reward_history),
+            'detection_results': detection_results,
+            'epsilon_change': self.epsilon - old_epsilon,
+            'lr_change': new_lr - old_lr,
+            'memory_refresh': refresh_size if len(self.memory) > 0 else 0
+        }
+        self.training_metrics['intervention_history'].append(intervention_record)
+        
+        self.intervention_applied = True
+        return True
     def train(self, episodes, patience, log_interval, model_save_path):
-        start_time = time.time(); best_reward = -float('inf'); early_stop_counter = 0
-        # 记录每个轮次的最佳奖励，用于检测早熟问题
+        """训练强化学习模型"""
+        print(f"开始训练，总轮次: {episodes}")
+        
+        # 训练历史记录
         episode_rewards = []
         episode_losses = []
+        intervention_history = []
         
-        for ep in tqdm(range(episodes), desc="Training"):
-            state, done, total_reward = self.env.reset(), False, 0
-            episode_loss = []
+        # 早停检测相关
+        best_reward = float('-inf')
+        patience_counter = 0
+        early_stopping_triggered = False
+        
+        # 自适应训练参数
+        current_lr = self.optimizer.param_groups[0]['lr']
+        current_epsilon = self.epsilon
+        
+        for episode in tqdm(range(episodes), desc="训练进度"):
+            state = self.env.reset()
+            episode_reward = 0
+            episode_loss = 0
+            steps = 0
             
-            for _ in range(len(self.env.uavs) * len(self.env.targets)):
-                valid_mask = self._get_valid_action_mask()
-                if not valid_mask.any(): break
-                if random.random() < self.epsilon: action_idx = random.choice(torch.where(valid_mask)[0]).item()
-                else:
-                    with torch.no_grad(): qs = self.model(torch.FloatTensor(state).unsqueeze(0).to(self.device)).squeeze(0); qs[~valid_mask] = -float('inf'); action_idx = qs.argmax().item()
-                action = self._index_to_action(action_idx); next_state, reward, done, _ = self.env.step(action)
-                self.remember(state, action, reward, next_state, done); state, total_reward = next_state, total_reward + reward; 
-                loss = self.replay()
-                if loss is not None:
-                    episode_loss.append(loss)
-                self.step_count += 1
-                if done: break
+            while True:
+                # 获取有效动作掩码
+                valid_actions = self.env._get_valid_action_mask()
+                if not any(valid_actions):
+                    break
                 
-            # 记录本轮次的平均损失
-            avg_loss = np.mean(episode_loss) if episode_loss else 0
-            episode_losses.append(avg_loss)
-            episode_rewards.append(total_reward)
-            
-            self.train_history['episode_rewards'].append(total_reward)
-            if (ep + 1) % log_interval == 0: 
-                tqdm.write(f"轮次 {ep+1}/{episodes} | 奖励: {total_reward:.2f} | Epsilon: {self.epsilon:.3f} | Loss: {avg_loss:.4f}")
+                # 选择动作
+                action = self._select_action(state, valid_actions)
+                next_state, reward, done, _ = self.env.step(action)
                 
-                # 检测早熟问题 - 如果连续多轮奖励没有显著提升
-                if ep >= 100:  # 至少训练100轮后才检测
-                    recent_rewards = episode_rewards[-50:]  # 最近50轮的奖励
-                    if max(recent_rewards) <= best_reward * 1.01:  # 最近50轮的最佳奖励没有比历史最佳提升1%
-                        self.early_stop_detected = True
-                        tqdm.write(f"警告: 检测到可能的早熟问题，最近50轮奖励无显著提升")
+                # 存储经验
+                self.memory.append((state, action, reward, next_state, done))
+                episode_reward += reward
+                state = next_state
+                steps += 1
+                
+                # 训练网络
+                if len(self.memory) >= self.batch_size:
+                    loss = self.replay()
+                    if loss is not None:
+                        episode_loss += loss
+                
+                if done:
+                    break
             
-            self.epsilon = max(self.config.EPSILON_MIN, self.epsilon * self.config.EPSILON_DECAY)
+            # 记录历史
+            episode_rewards.append(episode_reward)
+            if episode_loss > 0:
+                episode_losses.append(episode_loss / steps)
+            else:
+                episode_losses.append(0.0)
             
-            # 更新最佳奖励和早停计数器
-            if total_reward > best_reward:
-                best_reward, early_stop_counter = total_reward, 0
-                self.best_reward_history.append((ep, total_reward))
-                torch.save({'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict()}, model_save_path)
-            else: 
-                early_stop_counter += 1
+            # 早停检测
+            if len(episode_rewards) >= 20:
+                detection_results = self._detect_early_stopping(episode, episode_rewards, episode_losses)
+                
+                if detection_results['early_maturity_detected']:
+                    early_stopping_triggered = True
+                    intervention_results = self._apply_early_stopping_intervention(detection_results)
+                    
+                    if intervention_results['intervention_applied']:
+                        # 记录干预历史
+                        intervention_history.append({
+                            'episode': episode,
+                            'detection_type': detection_results['detection_type'],
+                            'epsilon_change': intervention_results['epsilon_change'],
+                            'lr_change': intervention_results['lr_change'],
+                            'intervention_type': intervention_results['intervention_type']
+                        })
+                        
+                        # 更新参数
+                        current_epsilon = intervention_results['new_epsilon']
+                        current_lr = intervention_results['new_lr']
+                        
+                        # 应用参数变化
+                        self.epsilon = current_epsilon
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                        
+                        print(f"轮次 {episode}: 检测到{detection_results['detection_type']}，应用{intervention_results['intervention_type']}干预")
+                        print(f"  探索率: {current_epsilon:.4f}, 学习率: {current_lr:.6f}")
             
-            if early_stop_counter >= patience: 
-                print(f"Early stopping at epoch {ep+1}")
+            # 定期保存模型
+            if (episode + 1) % 100 == 0:
+                self.save_model(model_save_path)
+            
+            # 早停检查
+            if episode_reward > best_reward:
+                best_reward = episode_reward
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"早停触发，轮次 {episode}")
                 break
         
-        # 保存训练历史数据，用于绘制收敛图
-        self.train_history['episode_rewards'] = episode_rewards
-        self.train_history['episode_losses'] = episode_losses
-        self.train_history['best_rewards'] = self.best_reward_history
+        # 保存最终模型
+        self.save_model(model_save_path)
         
-        # 新增: 保存训练历史到pickle文件
-        history_dir = os.path.dirname(model_save_path)
-        if not os.path.exists(history_dir):
-            os.makedirs(history_dir)
+        # 生成增强收敛图
+        self._plot_enhanced_convergence(model_save_path)
         
-        # 从模型保存路径中提取参数信息
-        import re
-        # 修改正则表达式以匹配实际的路径格式
-        match = re.search(r'steps(\d+)', model_save_path)
-        if match:
-            episodes = match.group(1)
-            phrrt = 'True' if config.USE_PHRRT_DURING_TRAINING else 'False'
-            print(f"调试: 提取到参数 - episodes={episodes}, phrrt={phrrt}")
-            history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{phrrt}.pkl')
-            # 确认train_history内容
-            print(f"调试: 训练历史包含键: {self.train_history.keys()}, 奖励数据点数量: {len(self.train_history.get('episode_rewards', []))}")
-            with open(history_path, 'wb') as f:
-                pickle.dump(self.train_history, f)
-            print(f"训练历史已保存至: {history_path}")
-        else:
-            print(f"警告: 未能从模型路径提取episodes参数，模型路径: {model_save_path}")
-            # 使用默认参数保存
-            history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{config.USE_PHRRT_DURING_TRAINING}.pkl')
-            with open(history_path, 'wb') as f:
-                pickle.dump(self.train_history, f)
-            print(f"训练历史已保存至: {history_path}")
+        # 生成奖励曲线报告
+        self._generate_reward_curve_report(model_save_path)
         
-        # 绘制并保存训练收敛图
-        self._plot_convergence(model_save_path)
+        # 保存训练历史
+        history_data = {
+            'episode_rewards': episode_rewards,
+            'episode_losses': episode_losses,
+            'intervention_history': intervention_history,
+            'early_stopping_triggered': early_stopping_triggered,
+            'final_epsilon': current_epsilon,
+            'final_lr': current_lr
+        }
         
-        return time.time() - start_time
+        history_path = model_save_path.replace('.pth', '_history.pkl')
+        with open(history_path, 'wb') as f:
+            pickle.dump(history_data, f)
         
-    def _plot_convergence(self, model_save_path):
-        """绘制训练收敛情况图表"""
+        print(f"训练完成，总轮次: {len(episode_rewards)}")
+        print(f"最佳奖励: {best_reward:.2f}")
+        print(f"最终探索率: {current_epsilon:.4f}")
+        print(f"最终学习率: {current_lr:.6f}")
+        if intervention_history:
+            print(f"干预次数: {len(intervention_history)}")
+        
+        return episode_rewards, episode_losses
+
+    def _plot_enhanced_convergence(self, model_save_path):
+        """绘制增强的训练收敛情况图表，包含早熟检测和干预信息"""
         # 创建保存路径
         save_dir = os.path.dirname(model_save_path)
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         
         # 创建图表
-        plt.figure(figsize=(12, 10))
+        fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+        fig.suptitle('增强训练收敛分析 - 包含早熟检测与干预', fontsize=16, fontweight='bold')
         
         # 1. 奖励收敛图
-        plt.subplot(2, 1, 1)
+        ax1 = axes[0, 0]
         rewards = self.train_history['episode_rewards']
-        plt.plot(rewards, label='每轮奖励')
+        episodes = range(1, len(rewards) + 1)
+        ax1.plot(episodes, rewards, 'b-', alpha=0.6, label='每轮奖励')
         
         # 添加移动平均线
         window_size = min(50, len(rewards))
         if window_size > 0:
             moving_avg = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(range(window_size-1, len(rewards)), moving_avg, 'r', label=f'{window_size}轮移动平均')
+            moving_episodes = range(window_size, len(rewards) + 1)
+            ax1.plot(moving_episodes, moving_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
         
-        # 标记最佳奖励点
-        best_rewards = self.train_history['best_rewards']
-        if best_rewards:
-            best_x, best_y = zip(*best_rewards)
-            plt.scatter(best_x, best_y, c='green', marker='*', s=100, label='最佳奖励')
+        # 标记早熟检测点
+        if hasattr(self, 'early_stop_history') and self.early_stop_history:
+            for ep, detected in self.early_stop_history:
+                if detected:
+                    ax1.axvline(x=ep, color='red', linestyle='--', alpha=0.7, label='早熟检测' if ep == self.early_stop_history[0][0] else "")
         
-        plt.title('训练奖励收敛情况')
-        plt.xlabel('训练轮次')
-        plt.ylabel('奖励值')
-        plt.legend()
-        plt.grid(True)
+        # 标记干预点
+        if hasattr(self, 'intervention_history') and self.intervention_history:
+            for ep, intervention_type in self.intervention_history:
+                ax1.axvline(x=ep, color='orange', linestyle=':', alpha=0.7, label=f'干预({intervention_type})' if ep == self.intervention_history[0][0] else "")
+        
+        ax1.set_title('奖励收敛曲线')
+        ax1.set_xlabel('训练轮次')
+        ax1.set_ylabel('奖励值')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
         # 2. 损失收敛图
-        plt.subplot(2, 1, 2)
-        losses = self.train_history['episode_losses']
-        plt.plot(losses, label='每轮损失')
+        ax2 = axes[0, 1]
+        if 'episode_losses' in self.train_history and self.train_history['episode_losses']:
+            losses = self.train_history['episode_losses']
+            loss_episodes = range(1, len(losses) + 1)
+            ax2.plot(loss_episodes, losses, 'g-', alpha=0.6, label='每轮损失')
+            
+            # 添加移动平均线
+            if len(losses) >= window_size:
+                moving_loss_avg = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
+                moving_loss_episodes = range(window_size, len(losses) + 1)
+                ax2.plot(moving_loss_episodes, moving_loss_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
+            
+            ax2.set_title('损失收敛曲线')
+            ax2.set_xlabel('训练轮次')
+            ax2.set_ylabel('损失值')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+        else:
+            ax2.text(0.5, 0.5, '无损失数据', ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title('损失收敛曲线')
         
-        # 添加移动平均线
-        window_size = min(50, len(losses))
-        if window_size > 0 and any(losses):
-            moving_avg = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(range(window_size-1, len(losses)), moving_avg, 'r', label=f'{window_size}轮移动平均')
+        # 3. 梯度范数变化
+        ax3 = axes[1, 0]
+        if 'gradient_norms' in self.train_history and self.train_history['gradient_norms']:
+            grad_norms = self.train_history['gradient_norms']
+            grad_episodes = range(1, len(grad_norms) + 1)
+            ax3.plot(grad_episodes, grad_norms, 'purple', alpha=0.6, label='梯度范数')
+            
+            # 添加移动平均线
+            if len(grad_norms) >= window_size:
+                moving_grad_avg = np.convolve(grad_norms, np.ones(window_size)/window_size, mode='valid')
+                moving_grad_episodes = range(window_size, len(grad_norms) + 1)
+                ax3.plot(moving_grad_episodes, moving_grad_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
+            
+            ax3.set_title('梯度范数变化')
+            ax3.set_xlabel('训练轮次')
+            ax3.set_ylabel('梯度范数')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+        else:
+            ax3.text(0.5, 0.5, '无梯度数据', ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title('梯度范数变化')
         
-        plt.title('训练损失收敛情况')
-        plt.xlabel('训练轮次')
-        plt.ylabel('损失值')
-        plt.legend()
-        plt.grid(True)
+        # 4. 探索率变化
+        ax4 = axes[1, 1]
+        if 'epsilon_values' in self.train_history and self.train_history['epsilon_values']:
+            epsilons = self.train_history['epsilon_values']
+            epsilon_episodes = range(1, len(epsilons) + 1)
+            ax4.plot(epsilon_episodes, epsilons, 'orange', alpha=0.6, label='探索率')
+            ax4.set_title('探索率变化')
+            ax4.set_xlabel('训练轮次')
+            ax4.set_ylabel('探索率')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, '无探索率数据', ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title('探索率变化')
         
-        # 添加早熟检测结果
-        if self.early_stop_detected:
-            plt.figtext(0.5, 0.01, "警告: 检测到可能的早熟问题，训练轮次增加但效果无显著提升", 
-                       ha='center', color='red', fontsize=12, bbox=dict(facecolor='yellow', alpha=0.5))
+        # 5. 早熟检测指标
+        ax5 = axes[2, 0]
+        if hasattr(self, 'early_stop_metrics') and self.early_stop_metrics:
+            metrics = self.early_stop_metrics
+            episodes = range(1, len(metrics) + 1)
+            
+            # 绘制多维度指标
+            for metric_name, values in metrics.items():
+                if len(values) == len(episodes):
+                    ax5.plot(episodes, values, alpha=0.6, label=metric_name)
+            
+            ax5.set_title('早熟检测指标')
+            ax5.set_xlabel('训练轮次')
+            ax5.set_ylabel('指标值')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+        else:
+            ax5.text(0.5, 0.5, '无早熟检测数据', ha='center', va='center', transform=ax5.transAxes)
+            ax5.set_title('早熟检测指标')
         
-        # 保存图表
+        # 6. 干预历史统计
+        ax6 = axes[2, 1]
+        if hasattr(self, 'intervention_history') and self.intervention_history:
+            intervention_types = [intervention[1] for intervention in self.intervention_history]
+            intervention_counts = {}
+            for intervention_type in intervention_types:
+                intervention_counts[intervention_type] = intervention_counts.get(intervention_type, 0) + 1
+            
+            if intervention_counts:
+                types = list(intervention_counts.keys())
+                counts = list(intervention_counts.values())
+                ax6.bar(types, counts, color=['red', 'orange', 'yellow'])
+                ax6.set_title('干预类型统计')
+                ax6.set_xlabel('干预类型')
+                ax6.set_ylabel('干预次数')
+                ax6.tick_params(axis='x', rotation=45)
+        else:
+            ax6.text(0.5, 0.5, '无干预数据', ha='center', va='center', transform=ax6.transAxes)
+            ax6.set_title('干预类型统计')
+        
         plt.tight_layout()
-        convergence_plot_path = os.path.join(save_dir, 'training_convergence.png')
-        plt.savefig(convergence_plot_path)
+        
+        # 保存图片
+        convergence_path = model_save_path.replace('.pth', '_enhanced_convergence.png')
+        plt.savefig(convergence_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"训练收敛情况图已保存至: {convergence_plot_path}")
+        
+        print(f"增强收敛分析图已保存至: {convergence_path}")
+        
+        # 生成奖励曲线详细报告
+        self._generate_reward_curve_report(model_save_path)
+    
+    def _generate_reward_curve_report(self, model_save_path):
+        """生成奖励曲线详细报告"""
+        save_dir = os.path.dirname(model_save_path)
+        report_path = model_save_path.replace('.pth', '_reward_curve_report.txt')
+        
+        report_lines = []
+        report_lines.append("=" * 80)
+        report_lines.append("强化学习训练奖励曲线分析报告")
+        report_lines.append("=" * 80)
+        report_lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append("")
+        
+        # 奖励统计
+        if 'episode_rewards' in self.train_history:
+            rewards = self.train_history['episode_rewards']
+            report_lines.append("奖励统计:")
+            report_lines.append(f"  总训练轮次: {len(rewards)}")
+            report_lines.append(f"  最高奖励: {max(rewards):.2f}")
+            report_lines.append(f"  最低奖励: {min(rewards):.2f}")
+            report_lines.append(f"  平均奖励: {np.mean(rewards):.2f}")
+            report_lines.append(f"  奖励标准差: {np.std(rewards):.2f}")
+            report_lines.append(f"  最终奖励: {rewards[-1]:.2f}")
+            
+            # 奖励趋势分析
+            if len(rewards) > 10:
+                recent_rewards = rewards[-10:]
+                early_rewards = rewards[:10]
+                recent_avg = np.mean(recent_rewards)
+                early_avg = np.mean(early_rewards)
+                improvement = (recent_avg - early_avg) / abs(early_avg) * 100 if early_avg != 0 else 0
+                report_lines.append(f"  奖励改进: {improvement:.2f}%")
+            
+            # 收敛性分析
+            if len(rewards) > 50:
+                last_50 = rewards[-50:]
+                first_50 = rewards[:50]
+                convergence_ratio = np.std(last_50) / np.std(first_50) if np.std(first_50) > 0 else 0
+                report_lines.append(f"  收敛性指标: {convergence_ratio:.3f} (越小越稳定)")
+        
+        report_lines.append("")
+        
+        # 早熟检测统计
+        if hasattr(self, 'early_stop_history') and self.early_stop_history:
+            report_lines.append("早熟检测统计:")
+            total_detections = sum(1 for _, detected in self.early_stop_history if detected)
+            report_lines.append(f"  总检测次数: {len(self.early_stop_history)}")
+            report_lines.append(f"  早熟检测次数: {total_detections}")
+            report_lines.append(f"  早熟检测率: {total_detections/len(self.early_stop_history)*100:.1f}%")
+        
+        report_lines.append("")
+        
+        # 干预统计
+        if hasattr(self, 'intervention_history') and self.intervention_history:
+            report_lines.append("干预统计:")
+            intervention_types = {}
+            for _, intervention_type in self.intervention_history:
+                intervention_types[intervention_type] = intervention_types.get(intervention_type, 0) + 1
+            
+            for intervention_type, count in intervention_types.items():
+                report_lines.append(f"  {intervention_type}: {count}次")
+        
+        report_lines.append("")
+        
+        # 训练建议
+        report_lines.append("训练建议:")
+        if 'episode_rewards' in self.train_history:
+            rewards = self.train_history['episode_rewards']
+            if len(rewards) > 0:
+                final_reward = rewards[-1]
+                max_reward = max(rewards)
+                
+                if final_reward < max_reward * 0.8:
+                    report_lines.append("  - 当前奖励远低于历史最佳，建议调整学习率或增加训练轮次")
+                
+                if len(rewards) > 100 and np.std(rewards[-50:]) < np.std(rewards[:50]) * 0.1:
+                    report_lines.append("  - 奖励变化很小，可能已收敛，建议停止训练")
+                
+                if hasattr(self, 'intervention_history') and len(self.intervention_history) > 3:
+                    report_lines.append("  - 干预次数较多，建议调整早熟检测参数")
+        
+        # 保存报告
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(report_lines))
+        
+        print(f"奖励曲线分析报告已保存至: {report_path}")
 
     def get_task_assignments(self):
-        self.model.eval(); state = self.env.reset(); assignments = {u.id: [] for u in self.env.uavs}; done, step = False, 0
-        while not done and step < len(self.env.targets) * len(self.env.uavs):
-            with torch.no_grad():
-                valid_mask = self._get_valid_action_mask();
-                if not valid_mask.any(): break
-                qs = self.model(torch.FloatTensor(state).unsqueeze(0).to(self.device)).squeeze(0); qs[~valid_mask] = -float('inf'); action_idx = qs.argmax().item()
-            action = self._index_to_action(action_idx); assignments[action[1]].append((action[0], action[2])); state, _, done, _ = self.env.step(action); step += 1
-        self.model.train(); return assignments
+        """多次推理取最优值的任务分配方法"""
+        self.model.eval()
+        
+        # 获取多次推理的参数
+        n_inference_runs = getattr(self.config, 'RL_N_INFERENCE_RUNS', 10)
+        inference_temperature = getattr(self.config, 'RL_INFERENCE_TEMPERATURE', 0.1)
+        
+        best_assignments = None
+        best_reward = float('-inf')
+        
+        print(f"开始多次推理优化 (推理次数: {n_inference_runs})")
+        
+        for run in range(n_inference_runs):
+            # 重置环境
+            state = self.env.reset()
+            assignments = {u.id: [] for u in self.env.uavs}
+            done, step = False, 0
+            total_reward = 0
+            
+            while not done and step < len(self.env.targets) * len(self.env.uavs):
+                with torch.no_grad():
+                    valid_mask = self._get_valid_action_mask()
+                    if not valid_mask.any():
+                        break
+                    
+                    # 添加温度参数以增加探索性
+                    qs = self.model(torch.FloatTensor(state).unsqueeze(0).to(self.device)).squeeze(0)
+                    qs[~valid_mask] = -float('inf')
+                    
+                    # 使用温度参数进行softmax采样
+                    if inference_temperature > 0:
+                        probs = torch.softmax(qs / inference_temperature, dim=0)
+                        action_idx = torch.multinomial(probs, 1).item()
+                    else:
+                        action_idx = qs.argmax().item()
+                
+                action = self._index_to_action(action_idx)
+                assignments[action[1]].append((action[0], action[2]))
+                state, reward, done, _ = self.env.step(action)
+                total_reward += reward
+                step += 1
+            
+            # 评估当前推理结果
+            if total_reward > best_reward:
+                best_reward = total_reward
+                best_assignments = assignments.copy()
+                print(f"推理轮次 {run+1}: 发现更好的分配方案 (奖励: {best_reward:.2f})")
+        
+        self.model.train()
+        print(f"多次推理完成，最优奖励: {best_reward:.2f}")
+        return best_assignments
     
 
     def load_model(self, path):
@@ -686,11 +1145,11 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
     # [增加协同事件分析] 在报告中加入事件说明，解释资源竞争
     report_content = f'"""---------- {scenario_name} 执行报告 ----------\n\n'
 
-    # [二次修复] 采用“协同贪婪”策略精确模拟资源消耗
+    # [二次修复] 采用"协同贪婪"策略精确模拟资源消耗
     temp_uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
     temp_target_resources = {t.id: t.resources.copy().astype(float) for t in targets}
 
-    # 1. 按“事件”（同一时间、同一目标）对所有步骤进行分组
+    # 1. 按"事件"（同一时间、同一目标）对所有步骤进行分组
     events = defaultdict(list)
     for uav_id, tasks in final_plan.items():
         for task in tasks:
@@ -736,11 +1195,11 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
 
     """(已更新并修复资源计算bug) 可视化任务分配方案。"""
     
-    # [二次修复] 采用“协同贪婪”策略精确模拟资源消耗
+    # [二次修复] 采用"协同贪婪"策略精确模拟资源消耗
     temp_uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
     temp_target_resources = {t.id: t.resources.copy().astype(float) for t in targets}
 
-    # 1. 按“事件”（同一时间、同一目标）对所有步骤进行分组
+    # 1. 按"事件"（同一时间、同一目标）对所有步骤进行分组
     events = defaultdict(list)
     for uav_id, tasks in final_plan.items():
         for task in tasks:
@@ -1131,33 +1590,21 @@ def main():
     config.USE_ADAPTIVE_TRAINING = True  # 启用自适应训练
     config.RUN_TRAINING = True  # 启用训练
     
-    # 从scenarios模块加载最复杂的场景数据
-    complex_uavs, complex_targets, complex_obstacles = get_complex_scenario_v4(config.OBSTACLE_TOLERANCE)
-    
-    print("\n" + "="*80)
-    print(">>> 测试自适应训练系统 <<<")
-    print("="*80)
-    
-    # 测试1: 基础训练
-    print("\n--- 测试1: 基础训练 (500轮) ---")
-    config.EPISODES = 500
-    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
-                "自适应训练测试-基础", show_visualization=False, save_report=True)
-    
-    # 测试2: 增量训练
-    print("\n--- 测试2: 增量训练 (增加到1000轮) ---")
-    config.EPISODES = 1000
-    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
-                "自适应训练测试-增量", show_visualization=False, save_report=True,
-                incremental_training=True)
-    
-    # 测试3: 强制重新训练
-    print("\n--- 测试3: 强制重新训练 (1000轮) ---")
-    run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
-                "自适应训练测试-强制重训", show_visualization=False, save_report=True,
-                force_retrain=True)
+    # 从scenarios模块加载战略价值陷阱场景
+    from scenarios import get_strategic_trap_scenario
+    strategic_uavs, strategic_targets, strategic_obstacles = get_strategic_trap_scenario(config.OBSTACLE_TOLERANCE)
+   
+    print("\n--- 测试战略价值陷阱场景 ---")
+    config.EPISODES = 300
+    run_scenario(config, strategic_uavs, strategic_targets, strategic_obstacles, 
+                "战略价值陷阱场景测试", show_visualization=False, save_report=True,
+                force_retrain=False, incremental_training=True)
 
-    print("\n===== [自适应训练测试完成] =====")
+    # print("\n--- 测试1: 1000 ---")
+    # config.EPISODES = 1000
+    # run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
+    #             "自适应训练测试-基础", show_visualization=False, save_report=True,
+    #             force_retrain=False,incremental_training=True)
 
 if __name__ == "__main__":
     main()

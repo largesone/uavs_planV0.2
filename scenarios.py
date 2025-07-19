@@ -262,3 +262,223 @@ def get_complex_scenario_v4(obstacle_tolerance):
     ]
     
     return uavs, targets, obstacles
+
+def get_rl_advantage_scenario(obstacle_tolerance=50.0):
+    """
+    创建体现RL算法优势的复杂场景
+    
+    该场景设计特点：
+    1. 动态资源需求：目标资源需求随时间变化
+    2. 多约束优化：同时考虑距离、时间、资源匹配
+    3. 不确定性：障碍物随机分布，路径规划复杂
+    4. 协作要求：需要多无人机协同完成任务
+    5. 实时适应：环境状态动态变化
+    
+    Args:
+        obstacle_tolerance (float): 障碍物容差
+        
+    Returns:
+        tuple: (uavs, targets, obstacles)
+    """
+    print("创建RL优势体现场景...")
+    
+    # 创建更多无人机和目标，增加问题复杂度
+    num_uavs = 15
+    num_targets = 25
+    num_obstacles = 30
+    
+    # 初始化无人机
+    uavs = []
+    for i in range(num_uavs):
+        # 分散的初始位置
+        x = random.uniform(50, 450)
+        y = random.uniform(50, 450)
+        position = np.array([x, y])
+        
+        # 多样化的资源配置
+        if i < 5:
+            # 高容量无人机
+            resources = np.array([random.uniform(800, 1200), random.uniform(600, 1000)])
+        elif i < 10:
+            # 中等容量无人机
+            resources = np.array([random.uniform(500, 800), random.uniform(400, 600)])
+        else:
+            # 低容量无人机
+            resources = np.array([random.uniform(200, 500), random.uniform(150, 400)])
+        
+        uav = UAV(
+            id=i,
+            position=position,
+            resources=resources.copy(),
+            velocity_range=(80, 120),
+            max_distance=2000,
+            heading=0.0,
+            economic_speed=100.0
+        )
+        uavs.append(uav)
+    
+    # 创建目标，具有动态资源需求
+    targets = []
+    for i in range(num_targets):
+        # 分散的目标位置
+        x = random.uniform(100, 400)
+        y = random.uniform(100, 400)
+        position = np.array([x, y])
+        
+        # 动态资源需求：不同目标有不同优先级
+        if i < 8:
+            # 高优先级目标
+            resources = np.array([random.uniform(600, 1000), random.uniform(400, 800)])
+        elif i < 15:
+            # 中等优先级目标
+            resources = np.array([random.uniform(300, 600), random.uniform(200, 500)])
+        else:
+            # 低优先级目标
+            resources = np.array([random.uniform(100, 300), random.uniform(80, 250)])
+        
+        target = Target(
+            id=i,
+            position=position,
+            resources=resources.copy(),
+            value=1.0
+        )
+        targets.append(target)
+    
+    # 创建复杂的障碍物分布
+    obstacles = []
+    for i in range(num_obstacles):
+        # 创建不同类型的障碍物
+        if i < 10:
+            # 大型障碍物
+            x = random.uniform(150, 350)
+            y = random.uniform(150, 350)
+            radius = random.uniform(30, 60)
+        elif i < 20:
+            # 中型障碍物
+            x = random.uniform(100, 400)
+            y = random.uniform(100, 400)
+            radius = random.uniform(15, 30)
+        else:
+            # 小型障碍物
+            x = random.uniform(50, 450)
+            y = random.uniform(50, 450)
+            radius = random.uniform(5, 15)
+        
+        # 确保障碍物不会完全阻塞路径
+        position = np.array([x, y])
+        
+        # 创建障碍物类（如果不存在则使用简单的圆形障碍物）
+        try:
+            from entities import Obstacle
+            obstacle = Obstacle(position, radius)
+        except ImportError:
+            # 如果Obstacle类不存在，创建一个简单的障碍物类
+            class SimpleObstacle:
+                def __init__(self, position, radius):
+                    self.position = position
+                    self.radius = radius
+                
+                def check_line_segment_collision(self, p1, p2):
+                    # 简单的线段碰撞检测
+                    return False  # 简化处理
+            
+            obstacle = SimpleObstacle(position, radius)
+        
+        # 检查是否与无人机或目标位置冲突
+        min_distance_to_uavs = min(float(np.linalg.norm(position - uav.position)) for uav in uavs)
+        min_distance_to_targets = min(float(np.linalg.norm(position - target.position)) for target in targets)
+        
+        if min_distance_to_uavs > radius + obstacle_tolerance and min_distance_to_targets > radius + obstacle_tolerance:
+            obstacles.append(obstacle)
+    
+    print(f"RL优势场景创建完成:")
+    print(f"  - 无人机数量: {len(uavs)}")
+    print(f"  - 目标数量: {len(targets)}")
+    print(f"  - 障碍物数量: {len(obstacles)}")
+    print(f"  - 场景复杂度: 高 (动态约束 + 多目标优化 + 不确定性)")
+    
+    return uavs, targets, obstacles
+
+def get_strategic_trap_scenario(obstacle_tolerance=50.0):
+    """
+    创建"战略价值陷阱"场景
+    
+    场景特点：
+    1. 高价值陷阱目标：在地图偏远角落放置价值极高的目标，被密集障碍物包围
+    2. 中价值集群目标：地图中心区域放置3-4个中等价值目标，距离较近
+    3. 资源异构性：部分无人机携带更多A类资源，部分携带更多B类资源
+    4. 中心目标集群对A、B类资源都有需求
+    
+    Args:
+        obstacle_tolerance: 障碍物安全距离
+        
+    Returns:
+        uavs: 无人机列表
+        targets: 目标列表  
+        obstacles: 障碍物列表
+    """
+    # 创建无人机 - 资源异构性设计
+    uavs = [
+        # A类资源丰富的无人机 (位置在中心区域)
+        UAV(1, np.array([200, 200]), 0.0, np.array([150, 50]), 1000, (20, 40), 30),
+        UAV(2, np.array([250, 200]), 0.0, np.array([140, 60]), 1000, (20, 40), 30),
+        UAV(3, np.array([200, 250]), 0.0, np.array([160, 40]), 1000, (20, 40), 30),
+        
+        # B类资源丰富的无人机 (位置在边缘区域)
+        UAV(4, np.array([100, 100]), 0.0, np.array([50, 150]), 1000, (20, 40), 30),
+        UAV(5, np.array([150, 100]), 0.0, np.array([60, 140]), 1000, (20, 40), 30),
+        UAV(6, np.array([100, 150]), 0.0, np.array([40, 160]), 1000, (20, 40), 30),
+        
+        # 平衡型无人机 (位置在中间区域)
+        UAV(7, np.array([300, 300]), 0.0, np.array([100, 100]), 1000, (20, 40), 30),
+        UAV(8, np.array([350, 300]), 0.0, np.array([90, 110]), 1000, (20, 40), 30),
+    ]
+    
+    # 创建目标 - 战略价值陷阱设计
+    targets = [
+        # 高价值陷阱目标 (在偏远角落，被障碍物包围)
+        Target(1, np.array([50, 50]), np.array([200, 200]), 200),  # 价值极高，但难以到达
+        
+        # 中价值集群目标 (在中心区域，易于协同)
+        Target(2, np.array([220, 220]), np.array([80, 80]), 80),   # 中心集群1
+        Target(3, np.array([240, 220]), np.array([70, 90]), 80),   # 中心集群2  
+        Target(4, np.array([220, 240]), np.array([90, 70]), 80),   # 中心集群3
+        Target(5, np.array([240, 240]), np.array([75, 85]), 80),   # 中心集群4
+        
+        # 边缘目标 (中等价值，需要特定资源)
+        Target(6, np.array([400, 100]), np.array([60, 120]), 60),  # 需要更多B类资源
+        Target(7, np.array([100, 400]), np.array([120, 60]), 60),  # 需要更多A类资源
+    ]
+    
+    # 创建障碍物 - 形成战略陷阱（改进版）
+    obstacles = [
+        # 包围高价值陷阱目标的障碍物（减少密度，确保可达性）
+        CircularObstacle(center=(40, 40), radius=8, tolerance=obstacle_tolerance),   # 陷阱目标周围
+        CircularObstacle(center=(60, 40), radius=8, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(40, 60), radius=8, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(60, 60), radius=8, tolerance=obstacle_tolerance),
+        
+        # 中心区域的轻微障碍物 (不影响协同)
+        CircularObstacle(center=(200, 200), radius=5, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(260, 200), radius=5, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(200, 260), radius=5, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(260, 260), radius=5, tolerance=obstacle_tolerance),
+        
+        # 边缘区域的障碍物（减少数量）
+        CircularObstacle(center=(350, 100), radius=8, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(100, 350), radius=8, tolerance=obstacle_tolerance),
+        
+        # 路径上的障碍物（减少数量和大小）
+        CircularObstacle(center=(150, 150), radius=12, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(300, 150), radius=12, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(150, 300), radius=12, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(300, 300), radius=12, tolerance=obstacle_tolerance),
+    ]
+    
+    print("战略价值陷阱场景已创建:")
+    print(f"  - 无人机数量: {len(uavs)} (A类资源丰富: 3架, B类资源丰富: 3架, 平衡型: 2架)")
+    print(f"  - 目标数量: {len(targets)} (高价值陷阱: 1个, 中价值集群: 4个, 边缘目标: 2个)")
+    print(f"  - 障碍物数量: {len(obstacles)} (密集包围陷阱目标)")
+    print("  - 场景特点: 资源异构性 + 价值陷阱 + 协同挑战")
+    
+    return uavs, targets, obstacles

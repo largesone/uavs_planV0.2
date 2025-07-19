@@ -206,3 +206,114 @@ def create_training_config_from_main_config(config) -> TrainingConfig:
     training_config = TrainingConfig()
     training_config.update_from_config(config)
     return training_config 
+
+def create_complex_scenario_training_config() -> TrainingConfig:
+    """
+    创建针对复杂场景的优化训练配置
+    
+    优化策略：
+    1. 增加训练轮次，给智能体更多时间探索
+    2. 减缓探索率衰减，保持更长时间的探索
+    3. 增大记忆库，记住更多样化的经验
+    4. 调整学习率，平衡收敛速度和稳定性
+    """
+    return TrainingConfig(
+        # 基础训练参数 - 针对复杂场景优化
+        episodes=2000,                    # 增加训练轮次
+        learning_rate=0.0005,            # 降低学习率，提高稳定性
+        gamma=0.99,                      # 提高折扣因子，更重视长期奖励
+        batch_size=256,                  # 增大批次大小，提高训练稳定性
+        memory_size=50000,               # 增大记忆库，记住更多经验
+        
+        # 探索策略参数 - 减缓衰减
+        epsilon_start=1.0,
+        epsilon_end=0.01,                # 降低最终探索率
+        epsilon_decay=0.9995,            # 减缓衰减速度
+        epsilon_min=0.05,                # 降低最小探索率
+        
+        # 网络更新参数
+        target_update_freq=15,           # 增加更新频率
+        patience=100,                    # 增加耐心值
+        log_interval=20,                 # 增加日志间隔
+        
+        # 自适应训练参数
+        use_adaptive_training=True,
+        monitoring_window=100,           # 增大监控窗口
+        min_episodes_before_detection=200,  # 增加最小检测轮次
+        
+        # 早熟检测参数 - 更严格的检测
+        stagnation_threshold=0.01,       # 降低停滞阈值
+        oscillation_threshold=12,        # 增加振荡检测阈值
+        convergence_trend_threshold=0.05,  # 降低收敛趋势阈值
+        
+        # 干预策略参数 - 更积极的干预
+        epsilon_adjustment_strong=0.5,   # 增强探索率调整
+        epsilon_adjustment_medium=0.3,
+        epsilon_adjustment_light=0.15,
+        learning_rate_adjustment_strong=2.0,  # 增强学习率调整
+        learning_rate_adjustment_medium=1.5,
+        
+        # 检查点参数
+        checkpoint_save_freq=100,        # 增加保存频率
+        max_checkpoints=10,              # 增加最大检查点数量
+        
+        # 调试参数
+        verbose=True,
+        debug_mode=False,
+        save_training_history=True
+    )
+
+def create_strategic_trap_training_config() -> TrainingConfig:
+    """
+    创建针对战略陷阱场景的专门训练配置
+    
+    该配置专门针对需要长期规划和权衡的场景设计：
+    1. 更长的训练时间，学习复杂的权衡策略
+    2. 更保守的探索策略，避免过早收敛到次优解
+    3. 更强的奖励信号，引导学习正确的权衡
+    """
+    return TrainingConfig(
+        # 基础训练参数 - 针对战略权衡优化
+        episodes=3000,                   # 更长的训练时间
+        learning_rate=0.0003,           # 更保守的学习率
+        gamma=0.995,                    # 更高的折扣因子，重视长期规划
+        batch_size=512,                 # 更大的批次
+        memory_size=100000,             # 更大的记忆库
+        
+        # 探索策略参数 - 更保守的探索
+        epsilon_start=1.0,
+        epsilon_end=0.005,              # 更低的最终探索率
+        epsilon_decay=0.9998,           # 更慢的衰减
+        epsilon_min=0.02,               # 更低的最小探索率
+        
+        # 网络更新参数
+        target_update_freq=20,          # 更频繁的更新
+        patience=150,                   # 更大的耐心值
+        log_interval=50,                # 更大的日志间隔
+        
+        # 自适应训练参数
+        use_adaptive_training=True,
+        monitoring_window=150,          # 更大的监控窗口
+        min_episodes_before_detection=300,  # 更晚开始检测
+        
+        # 早熟检测参数 - 更严格的检测
+        stagnation_threshold=0.005,     # 更严格的停滞检测
+        oscillation_threshold=15,       # 更严格的振荡检测
+        convergence_trend_threshold=0.02,  # 更严格的收敛检测
+        
+        # 干预策略参数 - 更温和的干预
+        epsilon_adjustment_strong=0.4,
+        epsilon_adjustment_medium=0.25,
+        epsilon_adjustment_light=0.1,
+        learning_rate_adjustment_strong=1.8,
+        learning_rate_adjustment_medium=1.3,
+        
+        # 检查点参数
+        checkpoint_save_freq=150,
+        max_checkpoints=15,
+        
+        # 调试参数
+        verbose=True,
+        debug_mode=False,
+        save_training_history=True
+    ) 

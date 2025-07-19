@@ -65,7 +65,7 @@ class AlgorithmAnalyzer:
                 print(f"数据形状: {df.shape}")
                 print(f"列名: {list(df.columns)}")
                 break
-            except FileNotFoundError:
+except FileNotFoundError:
                 continue
         
         if df is None:
@@ -189,28 +189,244 @@ class AlgorithmAnalyzer:
         
         return rl_data
 
+    def plot_metric_boxplots(self, df: pd.DataFrame):
+        """各算法在各指标上的箱线图/分组柱状图"""
+        metrics = ['total_reward_score', 'satisfied_targets_rate', 'resource_utilization_rate', 'load_balance_score', 'sync_feasibility_rate', 'total_time']
+        metric_names = ['综合评分', '目标满足率', '资源利用率', '负载均衡性', '同步可行性', '执行时间']
+        success_df = df[df['success'] == True] if 'success' in df.columns else df
+        if success_df.empty:
+            print("没有成功的测试数据，跳过箱线图")
+            return
+        for metric, name in zip(metrics, metric_names):
+            if metric not in success_df.columns:
+                continue
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='solver', y=metric, data=success_df)
+            plt.title(f'各算法{name}分布箱线图')
+            plt.xlabel('算法')
+            plt.ylabel(name)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, f'boxplot_{metric}.png'), dpi=300)
+            plt.close()
+
+    def analyze_failure_cases(self, df: pd.DataFrame):
+        """失败案例统计与原因分布"""
+        if 'success' not in df.columns or 'error_message' not in df.columns:
+            print("无失败案例数据")
+            return
+        failed = df[df['success'] == False]
+        if failed.empty:
+            print("无失败案例")
+            return
+        reason_counts = failed['error_message'].value_counts()
+        plt.figure(figsize=(10, 6))
+        reason_counts.plot(kind='bar')
+        plt.title('失败原因分布')
+        plt.xlabel('错误信息')
+        plt.ylabel('出现次数')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'failure_reason_distribution.png'), dpi=300)
+        plt.close()
+        # 失败案例按算法统计
+        fail_by_solver = failed.groupby('solver').size()
+        plt.figure(figsize=(8, 5))
+        fail_by_solver.plot(kind='bar')
+        plt.title('各算法失败案例数')
+        plt.xlabel('算法')
+        plt.ylabel('失败次数')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'failure_count_by_solver.png'), dpi=300)
+        plt.close()
+
+    def plot_robustness_analysis(self, df: pd.DataFrame):
+        """极端场景下的鲁棒性分析（如极端资源紧张/目标密集）"""
+        # 以场景规模和障碍物数量为极端性指标
+        if 'scenario_size' not in df.columns or 'num_obstacles' not in df.columns:
+            print("缺少鲁棒性分析所需字段")
+            return
+        # 选取最大/最小场景规模、障碍物数量的前10%为极端
+        size_threshold = np.percentile(df['scenario_size'], 90)
+        obs_threshold = np.percentile(df['num_obstacles'], 90)
+        extreme = df[(df['scenario_size'] >= size_threshold) | (df['num_obstacles'] >= obs_threshold)]
+        if extreme.empty:
+            print("无极端场景数据")
+            return
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x='solver', y='total_reward_score', data=extreme)
+        plt.title('极端场景下各算法综合评分分布')
+        plt.xlabel('算法')
+        plt.ylabel('综合评分')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'robustness_extreme_score.png'), dpi=300)
+        plt.close()
+        # 成功率
+        if 'success' in extreme.columns:
+            success_rate = extreme.groupby('solver')['success'].mean()
+            plt.figure(figsize=(8, 5))
+            success_rate.plot(kind='bar')
+            plt.title('极端场景下各算法成功率')
+            plt.xlabel('算法')
+            plt.ylabel('成功率')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'robustness_extreme_success.png'), dpi=300)
+            plt.close()
+
+    def plot_parameter_sensitivity(self, df: pd.DataFrame):
+        """参数敏感性分析（如RL的EPISODES、GA的POPULATION_SIZE等）"""
+        # RL参数
+        rl_df = df[df['solver'].str.contains('RL', case=False, na=False)]
+        if 'EPISODES' in rl_df.columns:
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='EPISODES', y='total_reward_score', data=rl_df)
+            plt.title('RL算法不同训练轮次下综合评分分布')
+            plt.xlabel('训练轮次(EPISODES)')
+            plt.ylabel('综合评分')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'sensitivity_rl_episodes.png'), dpi=300)
+            plt.close()
+        # GA参数
+        ga_df = df[df['solver'].str.contains('GA', case=False, na=False)]
+        if 'POPULATION_SIZE' in ga_df.columns:
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='POPULATION_SIZE', y='total_reward_score', data=ga_df)
+            plt.title('GA算法不同种群规模下综合评分分布')
+            plt.xlabel('种群规模(POPULATION_SIZE)')
+            plt.ylabel('综合评分')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'sensitivity_ga_population.png'), dpi=300)
+            plt.close()
+        if 'GENERATIONS' in ga_df.columns:
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='GENERATIONS', y='total_reward_score', data=ga_df)
+            plt.title('GA算法不同迭代代数下综合评分分布')
+            plt.xlabel('迭代代数(GENERATIONS)')
+            plt.ylabel('综合评分')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'sensitivity_ga_generations.png'), dpi=300)
+            plt.close()
+
+    def generate_rl_algorithm_description(self, df: pd.DataFrame) -> str:
+        """自动生成RL算法完整描述"""
+        desc = []
+        desc.append("【强化学习算法描述】")
+        desc.append("本系统采用基于图神经网络的深度强化学习（如DQN/Actor-Critic）进行多无人机任务分配。")
+        # 自动提取参数
+        if 'EPISODES' in df.columns:
+            desc.append(f"训练轮次(EPISODES)：{sorted(df['EPISODES'].dropna().unique())}")
+        if 'LEARNING_RATE' in df.columns:
+            desc.append(f"学习率(LEARNING_RATE)：{sorted(df['LEARNING_RATE'].dropna().unique())}")
+        if 'BATCH_SIZE' in df.columns:
+            desc.append(f"批次大小(BATCH_SIZE)：{sorted(df['BATCH_SIZE'].dropna().unique())}")
+        if 'USE_PHRRT_DURING_TRAINING' in df.columns:
+            vals = df['USE_PHRRT_DURING_TRAINING'].dropna().unique()
+            desc.append(f"训练时PH-RRT高精度路径：{[bool(v) for v in vals]}")
+        desc.append("奖励函数综合考虑任务完成、资源消耗、同步可行性等。")
+        desc.append("训练收敛判据为reward曲线稳定或达到最大轮次。");
+        desc.append("主要流程：状态编码→动作选择→环境反馈→奖励计算→参数更新。");
+        return '\n'.join(desc)
+
+    def analyze_rl_convergence(self, df: pd.DataFrame):
+        """RL收敛性分析：自动读取reward曲线，统计收敛速度、最终reward均值、波动性，并生成对比图"""
+        import glob
+        rl_df = df[df['solver'].str.contains('RL', case=False, na=False)]
+        if rl_df.empty:
+            print("无RL算法数据，跳过收敛性分析")
+            return
+        # 查找所有reward曲线图片和数据
+        reward_curves = []
+        for idx, row in rl_df.iterrows():
+            # 尝试查找output/下与场景、配置相关的reward曲线csv或png
+            scenario = row.get('scenario_name', '')
+            config = row.get('config_name', '')
+            pattern_csv = f"output/**/{scenario}*{config}*/training_convergence.csv"
+            pattern_png = f"output/**/{scenario}*{config}*/training_convergence.png"
+            csv_files = glob.glob(pattern_csv, recursive=True)
+            png_files = glob.glob(pattern_png, recursive=True)
+            if csv_files:
+                reward_curves.append({'csv': csv_files[0], 'scenario': scenario, 'config': config})
+            elif png_files:
+                reward_curves.append({'png': png_files[0], 'scenario': scenario, 'config': config})
+        # 统计收敛性
+        summary = []
+        plt.figure(figsize=(10, 6))
+        for rc in reward_curves:
+            if 'csv' in rc:
+                try:
+                    data = pd.read_csv(rc['csv'])
+                    if 'reward' in data.columns:
+                        rewards = data['reward'].values
+                    else:
+                        rewards = data.iloc[:, 1].values
+                    episodes = np.arange(len(rewards))
+                    plt.plot(episodes, rewards, label=f"{rc['scenario']}_{rc['config']}")
+                    # 收敛轮次（首次达到90%最大reward）
+                    max_r = np.max(rewards)
+                    threshold = max_r * 0.9
+                    converge_idx = np.argmax(rewards >= threshold)
+                    summary.append({
+                        'scenario': rc['scenario'],
+                        'config': rc['config'],
+                        'converge_episode': converge_idx,
+                        'final_reward': np.mean(rewards[-10:]),
+                        'std_reward': np.std(rewards[-10:])
+                    })
+                except Exception as e:
+                    print(f"读取{rc['csv']}失败: {e}")
+            # 若只有图片，无法统计但可展示
+        if summary:
+            plt.title('RL算法训练reward收敛曲线对比')
+            plt.xlabel('训练轮次')
+            plt.ylabel('reward')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'rl_convergence_curves.png'), dpi=300)
+            plt.close()
+        # 生成收敛性统计表
+        if summary:
+            df_sum = pd.DataFrame(summary)
+            df_sum.to_csv(os.path.join(self.output_dir, 'rl_convergence_summary.csv'), index=False)
+            # 收敛轮次分布
+            plt.figure(figsize=(8, 5))
+            plt.bar(df_sum['scenario'] + '_' + df_sum['config'], df_sum['converge_episode'])
+            plt.title('RL算法收敛轮次统计')
+            plt.ylabel('收敛轮次')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'rl_convergence_episode_bar.png'), dpi=300)
+            plt.close()
+            # 最终reward分布
+            plt.figure(figsize=(8, 5))
+            plt.bar(df_sum['scenario'] + '_' + df_sum['config'], df_sum['final_reward'])
+            plt.title('RL算法最终reward均值统计')
+            plt.ylabel('最终reward均值')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, 'rl_final_reward_bar.png'), dpi=300)
+            plt.close()
+        return summary
+
+    # 在主流程和报告中集成
     def create_comprehensive_plots(self, df: pd.DataFrame):
-        """创建综合分析图表"""
+        """创建综合分析图表（含详细评估、RL描述、收敛性分析）"""
         if df.empty:
             print("没有数据可以绘图")
             return
-        
-        # 1. 算法性能对比图
         self.plot_algorithm_comparison(df)
-        
-        # 2. RL算法详细分析
         rl_data = self.analyze_rl_performance(df)
         if not rl_data.empty:
             self.plot_rl_analysis(rl_data)
-        
-        # 3. 场景复杂度分析
         self.plot_scenario_complexity_analysis(df)
-        
-        # 4. 参数影响分析
         self.plot_parameter_impact_analysis(df)
-        
-        # 5. 性能雷达图
         self.plot_performance_radar(df)
+        self.plot_metric_boxplots(df)
+        self.analyze_failure_cases(df)
+        self.plot_robustness_analysis(df)
+        self.plot_parameter_sensitivity(df)
+        # 新增RL算法描述和收敛性分析
+        rl_desc = self.generate_rl_algorithm_description(df)
+        with open(os.path.join(self.output_dir, 'rl_algorithm_description.txt'), 'w', encoding='utf-8') as f:
+            f.write(rl_desc)
+        self.analyze_rl_convergence(df)
 
     def plot_algorithm_comparison(self, df: pd.DataFrame):
         """绘制算法性能对比图"""
@@ -409,7 +625,7 @@ class AlgorithmAnalyzer:
             ax1.set_ylabel('综合评分')
             ax1.set_title('训练轮次对评分的影响')
             ax1.grid(True, alpha=0.3)
-            ax1.legend()
+    ax1.legend()
         
         # 2. PH-RRT参数影响
         if 'USE_PHRRT_DURING_TRAINING' in rl_df.columns:
@@ -504,14 +720,16 @@ class AlgorithmAnalyzer:
         plt.show()
 
     def generate_comprehensive_report(self, df: pd.DataFrame):
-        """生成综合分析报告"""
+        """生成综合分析报告（集成RL算法描述和收敛性分析）"""
         report_lines = []
         report_lines.append("="*80)
         report_lines.append("算法对比分析综合报告")
         report_lines.append("="*80)
         report_lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report_lines.append("")
-        
+        # RL算法描述
+        report_lines.append(self.generate_rl_algorithm_description(df))
+        report_lines.append("")
         # 1. 数据概览
         report_lines.append("1. 数据概览")
         report_lines.append("-"*40)

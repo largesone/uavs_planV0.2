@@ -523,24 +523,24 @@ def run_quick_parameter_test():
                         train_history = pickle.load(f)
                     
                     episode_rewards = train_history.get('episode_rewards', [])
+                
+                if episode_rewards:
+                    # 绘制原始奖励曲线
+                    plt.plot(episode_rewards, alpha=0.3, label=f'EP={ep}, PHRRT={phrrt} (原始)')
                     
-                    if episode_rewards:
-                        # 绘制原始奖励曲线
-                        plt.plot(episode_rewards, alpha=0.3, label=f'EP={ep}, PHRRT={phrrt} (原始)')
-                        
-                        # 绘制移动平均线
-                        window_size = min(20, len(episode_rewards))
-                        if window_size > 0:
-                            moving_avg = np.convolve(episode_rewards, np.ones(window_size)/window_size, mode='valid')
-                            plt.plot(range(window_size-1, len(episode_rewards)), moving_avg, 
-                                     label=f'EP={ep}, PHRRT={phrrt} ({window_size}轮平均)')
-                        
-                        print(f'EP={ep}, PHRRT={phrrt}: 奖励数据点数量={len(episode_rewards)}, '\
-                              f'最小值={np.min(episode_rewards):.2f}, 最大值={np.max(episode_rewards):.2f}, '\
-                              f'平均值={np.mean(episode_rewards):.2f}')
+                    # 绘制移动平均线
+                    window_size = min(20, len(episode_rewards))
+                    if window_size > 0:
+                        moving_avg = np.convolve(episode_rewards, np.ones(window_size)/window_size, mode='valid')
+                        plt.plot(range(window_size-1, len(episode_rewards)), moving_avg, 
+                                 label=f'EP={ep}, PHRRT={phrrt} ({window_size}轮平均)')
+                    
+                    print(f'EP={ep}, PHRRT={phrrt}: 奖励数据点数量={len(episode_rewards)}, '\
+                          f'最小值={np.min(episode_rewards):.2f}, 最大值={np.max(episode_rewards):.2f}, '\
+                          f'平均值={np.mean(episode_rewards):.2f}')
                 except Exception as e:
                     print(f'加载训练历史文件失败: {str(e)}')
-                    continue
+                continue
             else:
                 print(f'未找到训练历史文件: EP={ep}, PHRRT={phrrt}')
     
