@@ -58,7 +58,8 @@ class GreedySolver_SelfContained:
                         continue
                     
                     for phi_idx in range(self.graph.n_phi):
-                        plan_result = self._plan_single_leg(u_state['pos'], target.position, u_state['heading'], self.graph.phi_set[phi_idx])
+                        phi_angle = phi_idx * (2 * np.pi / self.config.GRAPH_N_PHI)
+                        plan_result = self._plan_single_leg(u_state['pos'], target.position, u_state['heading'], phi_angle)
                         
                         if plan_result:
                             _, distance = plan_result
@@ -101,7 +102,7 @@ class GreedySolver_SelfContained:
             task_step_counter[uav_id] += 1
             u_state['pos'] = target_pos.copy()
             u_state['free_at'] = arrival_time
-            u_state['heading'] = self.graph.phi_set[best_move['phi_idx']]
+            u_state['heading'] = best_move['phi_idx'] * (2 * np.pi / self.config.GRAPH_N_PHI)
 
         generation_time = time.time() - start_time
         print(f"方案生成完成，耗时: {generation_time:.4f}s")

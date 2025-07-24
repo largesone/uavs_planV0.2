@@ -18,6 +18,7 @@ class UAV:
         self.task_sequence = []
         self.current_distance = 0
         self.current_position = np.array(position)
+        self.previous_position = None  # 用于塑形奖励计算
 
     def reset(self):
         """重置无人机的状态到初始值"""
@@ -25,6 +26,7 @@ class UAV:
         self.current_distance = 0
         self.current_position = self.position.copy()
         self.task_sequence = []
+        self.previous_position = None  # 重置位置历史
 
 class Target:
     """数据类：定义目标的所有属性和状态"""

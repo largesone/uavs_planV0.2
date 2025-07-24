@@ -1,130 +1,325 @@
 # -*- coding: utf-8 -*-
 # 文件名: config.py
-# 描述: 集中管理项目的所有配置参数（非训练相关）
+# 描述: 统一管理项目的所有配置参数，包括训练配置
+
+import os
+import pickle
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+
+@dataclass
+class TrainingConfig:
+    """训练配置类 - 统一管理所有训练参数"""
+    
+    # ===== 基础训练参数 =====
+    episodes: int = 2000                   # 训练轮次
+    learning_rate: float = 0.0001          # 提高学习率，加快收敛
+    gamma: float = 0.99                    # 提高折扣因子，更重视长期奖励
+    batch_size: int = 64                   # 减小批次大小，提高更新频率
+    memory_size: int = 15000               # 适当减小记忆库，避免过旧经验
+    
+    # ===== 探索策略参数 =====
+    epsilon_start: float = 0.9             # 降低初始探索率
+    epsilon_end: float = 0.1               # 提高最终探索率，保持适度探索
+    epsilon_decay: float = 0.9995          # 放缓探索率衰减
+    epsilon_min: float = 0.1               # 提高最小探索率
+    
+    # ===== 网络更新参数 =====
+    target_update_freq: int = 20           # 降低目标网络更新频率，增加稳定性
+    patience: int = 100                    # 增加早停耐心值
+    log_interval: int = 20                 # 减少日志输出频率
+    
+    # ===== 梯度裁剪参数 =====
+    use_gradient_clipping: bool = True     # 是否使用梯度裁剪
+    max_grad_norm: float = 1.0             # 最大梯度范数
+    
+    # ===== 优先经验回放参数 =====
+    use_prioritized_replay: bool = True    # 是否使用优先经验回放
+    per_alpha: float = 0.6                 # 优先级指数 (0=均匀采样, 1=完全优先级采样)
+    per_beta_start: float = 0.4            # 重要性采样权重初始值
+    per_beta_frames: int = 100000          # β从初始值增长到1.0的帧数
+    per_epsilon: float = 1e-6              # 防止优先级为0的小值
+    
+    # ===== 调试参数 =====
+    verbose: bool = True                   # 详细输出
+    debug_mode: bool = False               # 调试模式
+    save_training_history: bool = True     # 保存训练历史
 
 class Config:
-    """集中管理所有算法和模拟的参数（非训练相关）"""
+    """统一管理所有算法和模拟的参数"""
     
-    # ----- 训练系统控制参数 -----
-    RUN_TRAINING = False                         # 让模型学习新的奖励函数，True启用训练模式，False使用已训练好的模型
-    USE_ADAPTIVE_TRAINING = True               # 是否使用自适应训练系统，True启用，False关闭
-    USE_PHRRT_DURING_TRAINING = True          # 训练时是否使用高精度PH-RRT计算距离
-    USE_PHRRT_DURING_PLANNING = True          # 规划时是否使用高精度PH-RRT计算距离
-    CLEAR_MODEL_CACHE_BEFORE_TRAINING = True   # 支持增量训练，不清空模型缓存,True不清空，False清空
-    SAVED_MODEL_PATH = 'output/models/saved_model_final_efficient.pth' # 模型保存/加载路径
+    def __init__(self):
+        # ----- 训练系统控制参数 -----
+        self.TRAINING_MODE = 'training'                 # 训练模式: 'training'(训练), 'inference'(推理)
+        self.USE_PHRRT_DURING_TRAINING = True          # 训练时是否使用高精度PH-RRT计算距离
+        self.USE_PHRRT_DURING_PLANNING = True           # 规划时是否使用高精度PH-RRT计算距离
+        self.SAVED_MODEL_PATH = 'output/models/saved_model_final.pth' # 模型保存/加载路径
+        
+        # ----- 网络结构选择参数 -----
+        # 网络结构类型: SimpleNetwork、DeepFCN、GAT、DeepFCNResidual
+        self.NETWORK_TYPE = 'DeepFCNResidual'  # 修正网络类型名称
+        
+        # ----- 路径规划参数 =====
+        self.RRT_ITERATIONS = 1000          # RRT迭代次数
+        self.RRT_STEP_SIZE = 50.0           # RRT步长
+        self.RRT_GOAL_BIAS = 0.1            # 目标偏向概率
+        self.RRT_ADAPTIVE_STEP = True       # 是否使用自适应步长
+        self.RRT_OBSTACLE_AWARE = True      # 是否使用障碍物感知采样
+        self.RRT_MAX_ATTEMPTS = 3           # 最大尝试次数
+        
+        # ===== PH曲线平滑参数 =====
+        self.MAX_REFINEMENT_ATTEMPTS = 5    # 最大细化尝试次数
+        self.BEZIER_SAMPLES = 50            # 贝塞尔曲线采样点数
+        self.OBSTACLE_TOLERANCE = 50.0      # 障碍物的安全容忍距离
 
-    # ----- RL推理优化参数 -----
-    RL_N_INFERENCE_RUNS = 10                   # RL推理时的多次推理次数
-    RL_INFERENCE_TEMPERATURE = 0.1             # RL推理时的温度参数，控制探索性
-    RL_ENSEMBLE_SIZE = 3                       # RL集成学习的大小
-    RL_USE_ENSEMBLE = True                     # 是否使用集成学习
+        # ----- 图构建参数 -----
+        self.GRAPH_N_PHI = 6                # 构建图时，每个目标节点的离散化接近角度数量
 
-    # ===== RRT路径规划参数 =====
-    RRT_ITERATIONS = 1000          # RRT迭代次数
-    RRT_STEP_SIZE = 50.0           # RRT步长
-    RRT_GOAL_BIAS = 0.1            # 目标偏向概率
-    RRT_ADAPTIVE_STEP = True       # 是否使用自适应步长
-    RRT_OBSTACLE_AWARE = True      # 是否使用障碍物感知采样
-    RRT_MAX_ATTEMPTS = 3           # 最大尝试次数
+        # ----- 模拟与评估参数 -----
+        self.SHOW_VISUALIZATION = False     # 是否显示最终结果的可视化图表
+        self.LOAD_BALANCE_PENALTY = 0.1    # 负载均衡惩罚系数
+
+        # ----- 奖励函数参数 -----
+        self.TARGET_COMPLETION_REWARD = 1500    # 目标完成奖励
+        self.MARGINAL_UTILITY_FACTOR = 1000    # 边际效用因子
+        self.EFFICIENCY_REWARD_FACTOR = 500     # 效率奖励因子
+        self.DISTANCE_PENALTY_FACTOR = 0.1     # 距离惩罚因子
+        self.TIME_PENALTY_FACTOR = 10          # 时间惩罚因子
+        self.COMPLETION_REWARD = 1000          # 完成奖励
+        self.INVALID_ACTION_PENALTY = -100     # 无效动作惩罚
+        self.ZERO_CONTRIBUTION_PENALTY = -50   # 零贡献惩罚
+        self.DEADLOCK_PENALTY = -200           # 死锁惩罚
+        self.COLLABORATION_BONUS = 200         # 协作奖励
+
+        # ----- 训练配置对象 -----
+        self.training_config = TrainingConfig()
+        
+        # 设置统一的训练参数访问接口
+        self._setup_unified_training_params()
     
-    # ===== PH曲线平滑参数 =====
-    MAX_REFINEMENT_ATTEMPTS = 5    # 最大细化尝试次数
-    BEZIER_SAMPLES = 50            # 贝塞尔曲线采样点数
-    OBSTACLE_TOLERANCE = 50.0  # 障碍物的安全容忍距离
-
-    # ----- 图构建参数 -----
-    GRAPH_N_PHI = 6            # 构建图时，每个目标节点的离散化接近角度数量
-
-    # ----- 模拟与评估参数 -----
-    SHOW_VISUALIZATION = False  # 是否显示最终结果的可视化图表
-    CLEAR_MODEL_CACHE = True   # 强制重新训练，学习新的奖励函数
-    LOAD_BALANCE_PENALTY = 0.1 # 负载均衡惩罚系数
-
-    # ----- 训练参数（已迁移到TrainingConfig，保留用于兼容性） -----
-    # 注意：这些参数现在由temp_code/training_config.py中的TrainingConfig管理
-    # 以下参数仅用于向后兼容，建议使用TrainingConfig
+    def _setup_unified_training_params(self):
+        """
+        设置统一的训练参数访问接口
+        所有训练相关参数都通过training_config统一管理，避免重复定义
+        """
+        # 为了向后兼容，提供属性访问接口
+        pass
     
-    # 基础训练参数
-    EPISODES = 500            # 训练轮次
-    LEARNING_RATE = 0.001     # 学习率
-    GAMMA = 0.98               # 折扣因子
-    BATCH_SIZE = 128           # 批次大小
-    MEMORY_SIZE = 20000        # 记忆库大小
-    MEMORY_CAPACITY = 20000    # 经验回放池容量
-    TARGET_UPDATE_INTERVAL = 10 # 目标网络更新间隔
+    # ===== 统一的训练参数访问属性 =====
+    @property
+    def EPISODES(self):
+        return self.training_config.episodes
     
-    # 探索策略参数
-    EPSILON_START = 1.0         # 初始探索率
-    EPSILON_END = 0.05          # 最终探索率
-    EPSILON_DECAY = 0.999       # 探索率衰减
-    EPSILON_MIN = 0.15          # 最小探索率
+    @EPISODES.setter
+    def EPISODES(self, value):
+        self.training_config.episodes = value
     
-    # 网络更新参数
-    TARGET_UPDATE_FREQ = 10    # 目标网络更新频率
-    PATIENCE = 50              # 早停耐心值
-    LOG_INTERVAL = 10          # 日志打印间隔
-
-    def get_training_config(self):
-        """获取训练配置对象（推荐使用）"""
-        try:
-            from temp_code.training_config import create_training_config_from_main_config
-            return create_training_config_from_main_config(self)
-        except ImportError:
-            print("警告: 无法导入TrainingConfig，使用默认配置")
-            return None
-
-    def print_config_summary(self):
-        """打印配置摘要"""
+    @property
+    def LEARNING_RATE(self):
+        return self.training_config.learning_rate
+    
+    @LEARNING_RATE.setter
+    def LEARNING_RATE(self, value):
+        self.training_config.learning_rate = value
+    
+    @property
+    def GAMMA(self):
+        return self.training_config.gamma
+    
+    @GAMMA.setter
+    def GAMMA(self, value):
+        self.training_config.gamma = value
+    
+    @property
+    def BATCH_SIZE(self):
+        return self.training_config.batch_size
+    
+    @BATCH_SIZE.setter
+    def BATCH_SIZE(self, value):
+        self.training_config.batch_size = value
+    
+    @property
+    def MEMORY_SIZE(self):
+        return self.training_config.memory_size
+    
+    @MEMORY_SIZE.setter
+    def MEMORY_SIZE(self, value):
+        self.training_config.memory_size = value
+    
+    @property
+    def MEMORY_CAPACITY(self):
+        return self.training_config.memory_size
+    
+    @MEMORY_CAPACITY.setter
+    def MEMORY_CAPACITY(self, value):
+        self.training_config.memory_size = value
+    
+    @property
+    def EPSILON_START(self):
+        return self.training_config.epsilon_start
+    
+    @EPSILON_START.setter
+    def EPSILON_START(self, value):
+        self.training_config.epsilon_start = value
+    
+    @property
+    def EPSILON_END(self):
+        return self.training_config.epsilon_end
+    
+    @EPSILON_END.setter
+    def EPSILON_END(self, value):
+        self.training_config.epsilon_end = value
+    
+    @property
+    def EPSILON_DECAY(self):
+        return self.training_config.epsilon_decay
+    
+    @EPSILON_DECAY.setter
+    def EPSILON_DECAY(self, value):
+        self.training_config.epsilon_decay = value
+    
+    @property
+    def EPSILON_MIN(self):
+        return self.training_config.epsilon_min
+    
+    @EPSILON_MIN.setter
+    def EPSILON_MIN(self, value):
+        self.training_config.epsilon_min = value
+    
+    @property
+    def TARGET_UPDATE_FREQ(self):
+        return self.training_config.target_update_freq
+    
+    @TARGET_UPDATE_FREQ.setter
+    def TARGET_UPDATE_FREQ(self, value):
+        self.training_config.target_update_freq = value
+    
+    @property
+    def PATIENCE(self):
+        return self.training_config.patience
+    
+    @PATIENCE.setter
+    def PATIENCE(self, value):
+        self.training_config.patience = value
+    
+    @property
+    def LOG_INTERVAL(self):
+        return self.training_config.log_interval
+    
+    @LOG_INTERVAL.setter
+    def LOG_INTERVAL(self, value):
+        self.training_config.log_interval = value
+    
+    # ===== 便捷的参数修改方法 =====
+    def update_training_params(self, **kwargs):
+        """
+        便捷的训练参数批量更新方法
+        
+        使用示例:
+        config.update_training_params(
+            episodes=1000,
+            learning_rate=0.001,
+            batch_size=128
+        )
+        """
+        for key, value in kwargs.items():
+            if hasattr(self.training_config, key):
+                setattr(self.training_config, key, value)
+                print(f"✓ 更新训练参数: {key} = {value}")
+            else:
+                print(f"✗ 警告: 未知的训练参数 '{key}'")
+    
+    def get_training_summary(self):
+        """获取当前训练参数摘要"""
+        summary = {
+            "基础参数": {
+                "episodes": self.training_config.episodes,
+                "learning_rate": self.training_config.learning_rate,
+                "gamma": self.training_config.gamma,
+                "batch_size": self.training_config.batch_size,
+                "memory_size": self.training_config.memory_size,
+            },
+            "探索策略": {
+                "epsilon_start": self.training_config.epsilon_start,
+                "epsilon_end": self.training_config.epsilon_end,
+                "epsilon_decay": self.training_config.epsilon_decay,
+                "epsilon_min": self.training_config.epsilon_min,
+            },
+            "网络更新": {
+                "target_update_freq": self.training_config.target_update_freq,
+                "patience": self.training_config.patience,
+                "log_interval": self.training_config.log_interval,
+            },
+            "优先经验回放": {
+                "use_prioritized_replay": self.training_config.use_prioritized_replay,
+                "per_alpha": self.training_config.per_alpha,
+                "per_beta_start": self.training_config.per_beta_start,
+                "per_beta_frames": self.training_config.per_beta_frames,
+            }
+        }
+        return summary
+    
+    def print_training_config(self):
+        """打印当前训练配置"""
         print("=" * 60)
-        print("配置摘要")
+        print("当前训练配置参数")
         print("=" * 60)
         
-        # 训练系统控制
-        print("训练系统控制:")
-        print(f"  - RUN_TRAINING: {self.RUN_TRAINING}")
-        print(f"  - USE_ADAPTIVE_TRAINING: {self.USE_ADAPTIVE_TRAINING}")
-        print(f"  - USE_PHRRT_DURING_TRAINING: {self.USE_PHRRT_DURING_TRAINING}")
-        print(f"  - USE_PHRRT_DURING_PLANNING: {self.USE_PHRRT_DURING_PLANNING}")
-        print(f"  - CLEAR_MODEL_CACHE_BEFORE_TRAINING: {self.CLEAR_MODEL_CACHE_BEFORE_TRAINING}")
+        summary = self.get_training_summary()
+        for category, params in summary.items():
+            print(f"\n{category}:")
+            print("-" * 30)
+            for key, value in params.items():
+                print(f"  {key}: {value}")
         
-        # 路径规划参数
-        print("\n路径规划参数:")
-        print(f"  - RRT_ITERATIONS: {self.RRT_ITERATIONS}")
-        print(f"  - RRT_STEP_SIZE: {self.RRT_STEP_SIZE}")
-        print(f"  - MAX_REFINEMENT_ATTEMPTS: {self.MAX_REFINEMENT_ATTEMPTS}")
-        print(f"  - OBSTACLE_TOLERANCE: {self.OBSTACLE_TOLERANCE}")
+        print("\n" + "=" * 60)
         
-        # 图构建参数
-        print("\n图构建参数:")
-        print(f"  - GRAPH_N_PHI: {self.GRAPH_N_PHI}")
+        # 新增的训练参数
+        self.use_gradient_clipping = self.training_config.use_gradient_clipping
+        self.max_grad_norm = self.training_config.max_grad_norm
+    
+    def update_training_config(self, new_config: TrainingConfig):
+        """更新训练配置"""
+        self.training_config = new_config
+        self._setup_backward_compatibility()
+    
+    def get_training_config(self) -> TrainingConfig:
+        """获取当前训练配置"""
+        return self.training_config
+    
+    def load_existing_model(self, model_path: str = None) -> bool:
+        """尝试加载已存在的模型"""
+        if model_path is None:
+            model_path = self.SAVED_MODEL_PATH
         
-        # 模拟与评估参数
-        print("\n模拟与评估参数:")
-        print(f"  - SHOW_VISUALIZATION: {self.SHOW_VISUALIZATION}")
-        print(f"  - CLEAR_MODEL_CACHE: {self.CLEAR_MODEL_CACHE}")
-        print(f"  - LOAD_BALANCE_PENALTY: {self.LOAD_BALANCE_PENALTY}")
-        
-        # 训练参数（兼容性）
-        print("\n训练参数（兼容性，建议使用TrainingConfig）:")
-        print(f"  - EPISODES: {self.EPISODES}")
-        print(f"  - LEARNING_RATE: {self.LEARNING_RATE}")
-        print(f"  - GAMMA: {self.GAMMA}")
-        print(f"  - BATCH_SIZE: {self.BATCH_SIZE}")
-        print(f"  - EPSILON_START: {self.EPSILON_START}")
-        print(f"  - EPSILON_END: {self.EPSILON_END}")
-        print(f"  - PATIENCE: {self.PATIENCE}")
-        print(f"  - LOG_INTERVAL: {self.LOG_INTERVAL}")
-        
-        print("=" * 60)
-        print("注意: 训练相关参数建议使用temp_code/training_config.py中的TrainingConfig")
-        print("=" * 60)
-
-# =========================
-# 配置参数说明
-# =========================
-# UAV_NUM: 无人机数量，推荐3~20，影响任务分配复杂度
-# TARGET_NUM: 目标数量，推荐5~50，影响任务密度
-# EPISODES: RL训练轮次，推荐200~2000，越大越充分但耗时增加
-# LEARNING_RATE: 学习率，推荐1e-4~1e-2，过大易震荡，过小收敛慢
-# USE_PHRRT_DURING_TRAINING: 是否训练时用高精度PH-RRT，True提升精度，False加快训练
-# ...
+        if os.path.exists(model_path):
+            print(f"发现已存在的模型: {model_path}")
+            return True
+        return False
+    
+    # ===== 训练模式便捷方法 =====
+    def set_training_mode(self, mode: str):
+        """设置训练模式"""
+        valid_modes = ['training', 'inference']
+        if mode not in valid_modes:
+            raise ValueError(f"无效的训练模式: {mode}。有效模式: {valid_modes}")
+        self.TRAINING_MODE = mode
+    
+    def is_training_mode(self) -> bool:
+        """检查是否为训练模式"""
+        return self.TRAINING_MODE == 'training'
+    
+    def is_inference_mode(self) -> bool:
+        """检查是否为推理模式"""
+        return self.TRAINING_MODE == 'inference'
+    
+    # 向后兼容的方法
+    @property
+    def RUN_TRAINING(self) -> bool:
+        """向后兼容的RUN_TRAINING属性"""
+        return self.is_training_mode()
+    
+    @RUN_TRAINING.setter
+    def RUN_TRAINING(self, value: bool):
+        """向后兼容的RUN_TRAINING设置器"""
+        self.TRAINING_MODE = 'training' if value else 'inference'

@@ -6,6 +6,157 @@ import numpy as np
 import random
 from entities import UAV, Target
 from path_planning import CircularObstacle, PolygonalObstacle
+
+def get_balanced_scenario(obstacle_tolerance):
+    """
+    提供一个资源平衡的场景：10个无人机，5个目标，资源供给等于需求。
+    
+    Args:
+        obstacle_tolerance (float): 障碍物的安全容忍距离。
+
+    Returns:
+        tuple: 包含无人机列表、目标列表和障碍物列表。
+    """
+    # 5个目标及其资源需求
+    targets = [
+        Target(id=1, position=np.array([2000, 2000]), resources=np.array([150, 150]), value=100),
+        Target(id=2, position=np.array([3000, 2500]), resources=np.array([120, 130]), value=90),
+        Target(id=3, position=np.array([2500, 1000]), resources=np.array([100, 100]), value=80),
+        Target(id=4, position=np.array([1500, 3000]), resources=np.array([80, 70]), value=85),
+        Target(id=5, position=np.array([3500, 1500]), resources=np.array([50, 50]), value=75)
+    ]
+    
+    # 计算总需求
+    total_demand = np.array([500, 500])  # [150+120+100+80+50, 150+130+100+70+50]
+    
+    # 10个无人机，资源分配等于总需求
+    uavs = [
+        UAV(id=1, position=np.array([500, 500]), heading=np.pi/4, resources=np.array([80, 70]), max_distance=6000, velocity_range=(50, 150), economic_speed=100),
+        UAV(id=2, position=np.array([4500, 500]), heading=3*np.pi/4, resources=np.array([70, 80]), max_distance=6000, velocity_range=(60, 160), economic_speed=110),
+        UAV(id=3, position=np.array([500, 3500]), heading=-np.pi/4, resources=np.array([60, 60]), max_distance=6000, velocity_range=(55, 155), economic_speed=105),
+        UAV(id=4, position=np.array([4500, 3500]), heading=-3*np.pi/4, resources=np.array([50, 50]), max_distance=6000, velocity_range=(65, 165), economic_speed=115),
+        UAV(id=5, position=np.array([2500, 500]), heading=np.pi/2, resources=np.array([40, 40]), max_distance=6000, velocity_range=(70, 170), economic_speed=120),
+        UAV(id=6, position=np.array([500, 2000]), heading=0, resources=np.array([50, 50]), max_distance=6000, velocity_range=(45, 145), economic_speed=95),
+        UAV(id=7, position=np.array([4500, 2000]), heading=np.pi, resources=np.array([40, 40]), max_distance=6000, velocity_range=(75, 175), economic_speed=125),
+        UAV(id=8, position=np.array([1500, 500]), heading=np.pi/3, resources=np.array([30, 40]), max_distance=6000, velocity_range=(40, 140), economic_speed=90),
+        UAV(id=9, position=np.array([3500, 500]), heading=2*np.pi/3, resources=np.array([40, 30]), max_distance=6000, velocity_range=(80, 180), economic_speed=130),
+        UAV(id=10, position=np.array([2500, 3500]), heading=-np.pi/2, resources=np.array([40, 40]), max_distance=6000, velocity_range=(55, 155), economic_speed=105)
+    ]
+    
+    # 设计合理的障碍物
+    obstacles = [
+        # 中央障碍区域
+        CircularObstacle(center=(2500, 2000), radius=300, tolerance=obstacle_tolerance),
+        
+        # 四个角落的障碍物
+        PolygonalObstacle(vertices=[(500, 500), (1000, 700), (700, 1000)], tolerance=obstacle_tolerance),
+        PolygonalObstacle(vertices=[(4000, 500), (4500, 700), (4500, 300)], tolerance=obstacle_tolerance),
+        PolygonalObstacle(vertices=[(500, 3500), (700, 3000), (1000, 3500)], tolerance=obstacle_tolerance),
+        PolygonalObstacle(vertices=[(4000, 3500), (4500, 3300), (4300, 3000)], tolerance=obstacle_tolerance),
+        
+        # 通道障碍物
+        CircularObstacle(center=(1800, 1800), radius=200, tolerance=obstacle_tolerance),
+        CircularObstacle(center=(3200, 2200), radius=200, tolerance=obstacle_tolerance)
+    ]
+    
+    return uavs, targets, obstacles
+
+
+def get_simple_convergence_test_scenario(obstacle_tolerance=50.0):
+    """
+    提供一个简化的测试场景，用于算法收敛性测试。
+    特点：
+    - 2个UAV，1个Target
+    - 无障碍物
+    - 简单的资源分配
+    - 快速收敛验证
+    
+    Args:
+        obstacle_tolerance (float): 障碍物的安全容忍距离。
+
+    Returns:
+        tuple: 包含无人机列表、目标列表和障碍物列表。
+    """
+    # 创建2个UAV
+    uavs = [
+        UAV(
+            id="UAV_1",
+            position=np.array([0.0, 0.0, 10.0]),
+            heading=0.0,
+            resources=np.array([30.0, 30.0, 30.0]),
+            max_distance=100.0,
+            velocity_range=(0.0, 20.0),
+            economic_speed=15.0
+        ),
+        UAV(
+            id="UAV_2", 
+            position=np.array([10.0, 10.0, 10.0]),
+            heading=0.0,
+            resources=np.array([30.0, 30.0, 30.0]),
+            max_distance=100.0,
+            velocity_range=(0.0, 20.0),
+            economic_speed=15.0
+        )
+    ]
+    
+    # 创建1个Target
+    targets = [
+        Target(
+            id="Target_1",
+            position=np.array([50.0, 50.0, 0.0]),
+            resources=np.array([50.0, 50.0, 50.0]),
+            value=100.0
+        )
+    ]
+    
+    # 无障碍物，简化测试
+    obstacles = []
+    
+    return uavs, targets, obstacles
+
+def get_minimal_test_scenario(obstacle_tolerance=50.0):
+    """
+    提供最小化测试场景，用于快速验证算法基本功能。
+    特点：
+    - 1个UAV，1个Target
+    - 无障碍物
+    - 最简单的资源分配
+    - 极快速收敛
+    
+    Args:
+        obstacle_tolerance (float): 障碍物的安全容忍距离。
+
+    Returns:
+        tuple: 包含无人机列表、目标列表和障碍物列表。
+    """
+    # 创建1个UAV
+    uavs = [
+        UAV(
+            id="UAV_1",
+            position=np.array([0.0, 0.0, 10.0]),
+            heading=0.0,
+            resources=np.array([50.0, 50.0, 50.0]),
+            max_distance=100.0,
+            velocity_range=(0.0, 20.0),
+            economic_speed=15.0
+        )
+    ]
+    
+    # 创建1个Target
+    targets = [
+        Target(
+            id="Target_1",
+            position=np.array([50.0, 50.0, 0.0]),
+            resources=np.array([50.0, 50.0, 50.0]),
+            value=100.0
+        )
+    ]
+    
+    # 无障碍物
+    obstacles = []
+    
+    return uavs, targets, obstacles
+
 def get_new_experimental_scenario(obstacle_tolerance):
     """
     提供一个根据用户指定信息新增的实验场景。

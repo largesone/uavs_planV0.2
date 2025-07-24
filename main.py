@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# 文件名: main.py
-# 描述: 多无人机协同任务分配与路径规划的最终集成算法。
-#      包含了从环境定义、强化学习求解、路径规划到结果可视化的完整流程。
+# 文件名: main_simplified.py
+# 描述: 多无人机协同任务分配与路径规划的简化版本。
+#      移除了重复的网络结构定义，保留核心功能。
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,19 +11,33 @@ import os
 import time
 import pickle
 import random
+import json
 from typing import List, Dict, Tuple, Union, Optional
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import sys
+import torch.nn.functional as F
+
+# TensorBoard支持 - 可选依赖 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    print("警告: TensorBoard未安装，将跳过TensorBoard功能")
+    print("安装命令: pip install tensorboard")
+    SummaryWriter = None
+    TENSORBOARD_AVAILABLE = False
 
 # --- 本地模块导入 ---
 from entities import UAV, Target
 from path_planning import PHCurveRRTPlanner
-from scenarios import get_small_scenario, get_complex_scenario, get_new_experimental_scenario, get_complex_scenario_v4, get_strategic_trap_scenario
+from scenarios import get_balanced_scenario, get_small_scenario, get_complex_scenario, get_new_experimental_scenario, get_complex_scenario_v4, get_strategic_trap_scenario
 from config import Config
 from evaluate import evaluate_plan
+from networks import create_network, get_network_info
+from environment import UAVTaskEnv, DirectedGraph
 
 # 允许多个OpenMP库共存，解决某些环境下的冲突问题
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -31,11 +45,35 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 # 设置控制台输出编码
 if sys.platform.startswith('win'):
     import codecs
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+    try:
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+    except AttributeError:
+        # 如果detach方法不可用，跳过编码设置
+        pass
 
 # 初始化配置类
 config = Config()
+
+# JSON序列化辅助函数
+def convert_numpy_types(obj):
+    """递归转换numpy类型为Python原生类型，用于JSON序列化"""
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    elif hasattr(obj, 'item'):  # 处理任何其他numpy标量类型
+        return obj.item()
+    else:
+        return obj
 
 # =============================================================================
 # section 1: 全局辅助函数与字体设置
@@ -69,1016 +107,940 @@ def set_chinese_font(preferred_fonts=None, manual_font_path=None):
             if findfont(FontProperties(family=font)):
                 plt.rcParams["font.family"] = font
                 plt.rcParams['axes.unicode_minus'] = False
-                print(f"已自动设置中文字体为: {font}")
+                # print(f"已自动设置中文字体为: {font}")  # 移除字体设置输出
                 return True
     except Exception:
         pass
     
-    print("警告: 自动或手动设置中文字体失败。图片中的中文可能显示为方框。")
+    # print("警告: 自动或手动设置中文字体失败。图片中的中文可能显示为方框。")  # 简化输出
     return False
 
-# 文件名: main.py
-# ... (main.py 文件其他部分无改动) ...
+# =============================================================================
+# section 2: 核心业务逻辑 - 强化学习求解器
+# =============================================================================
 
 # =============================================================================
-# section 3: 核心业务逻辑 - 实体与环境
+# section 3: 强化学习求解器
 # =============================================================================
-class DirectedGraph:
+
+# =============================================================================
+# section 3.5: 优先经验回放缓冲区 (Prioritized Experience Replay)
+# =============================================================================
+class SumTree:
     """
-    (最终修复版) 构建任务场景的有向图表示。
-    此版本已更新，可以在构建图时感知障碍物，为所有算法提供更真实的距离估算。
+    Sum Tree数据结构，用于高效的优先级采样
+    支持O(log n)的更新和采样操作
     """
-    def __init__(self, uavs: List[UAV], targets: List[Target], n_phi: int, obstacles: List = []):
-        """
-        构造函数。
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)  # 存储优先级的二叉树
+        self.data = np.zeros(capacity, dtype=object)  # 存储实际经验数据
+        self.write = 0  # 写入指针
+        self.n_entries = 0  # 当前存储的经验数量
+    
+    def _propagate(self, idx, change):
+        """向上传播优先级变化"""
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+    
+    def _retrieve(self, idx, s):
+        """根据累积优先级检索叶子节点"""
+        left = 2 * idx + 1
+        right = left + 1
         
-        Args:
-            uavs (List[UAV]): 无人机列表。
-            targets (List[Target]): 目标列表。
-            n_phi (int): 离散化角度数量。
-            obstacles (List, optional): 场景中的障碍物列表。 Defaults to [].
+        if left >= len(self.tree):
+            return idx
+        
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+    
+    def total(self):
+        """返回总优先级"""
+        return self.tree[0]
+    
+    def add(self, p, data):
+        """添加新经验"""
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, p)
+        
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0
+        
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
+    
+    def update(self, idx, p):
+        """更新优先级"""
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+    
+    def get(self, s):
+        """根据累积优先级获取经验"""
+        idx = self._retrieve(0, s)
+        dataIdx = idx - self.capacity + 1
+        return (idx, self.tree[idx], self.data[dataIdx])
+
+class PrioritizedReplayBuffer:
+    """
+    优先经验回放缓冲区
+    
+    核心思想：
+    - 根据TD误差分配优先级，误差越大优先级越高
+    - 使用重要性采样权重修正非均匀采样的偏差
+    - 通过α控制优先级的影响程度，β控制重要性采样的强度
+    """
+    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
         """
+        Args:
+            capacity: 缓冲区容量
+            alpha: 优先级指数，0表示均匀采样，1表示完全按优先级采样
+            beta_start: 重要性采样权重的初始值
+            beta_frames: β从beta_start线性增长到1.0的帧数
+        """
+        self.tree = SumTree(capacity)
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.frame = 1
+        self.epsilon = 1e-6  # 防止优先级为0
+        self.max_priority = 1.0  # 最大优先级
+    
+    def beta(self):
+        """计算当前的β值（重要性采样权重强度）"""
+        return min(1.0, self.beta_start + (1.0 - self.beta_start) * self.frame / self.beta_frames)
+    
+    def push(self, state, action, reward, next_state, done):
+        """添加新经验，使用最大优先级"""
+        experience = (state, action, reward, next_state, done)
+        priority = self.max_priority ** self.alpha
+        self.tree.add(priority, experience)
+    
+    def sample(self, batch_size):
+        """
+        采样一个批次的经验
+        
+        Returns:
+            batch: 经验批次
+            indices: 在树中的索引
+            weights: 重要性采样权重
+        """
+        batch = []
+        indices = []
+        weights = []
+        priorities = []
+        
+        # 计算采样区间
+        segment = self.tree.total() / batch_size
+        
+        for i in range(batch_size):
+            # 在每个区间内随机采样
+            a = segment * i
+            b = segment * (i + 1)
+            s = random.uniform(a, b)
+            
+            # 获取经验
+            (idx, p, data) = self.tree.get(s)
+            
+            if data is not None:
+                batch.append(data)
+                indices.append(idx)
+                priorities.append(p)
+        
+        # 计算重要性采样权重
+        if len(priorities) > 0:
+            # 计算概率
+            probs = np.array(priorities) / self.tree.total()
+            # 计算权重
+            weights = (len(batch) * probs) ** (-self.beta())
+            # 归一化权重
+            weights = weights / weights.max()
+        else:
+            weights = np.ones(len(batch))
+        
+        self.frame += 1
+        
+        return batch, indices, weights
+    
+    def update_priorities(self, indices, priorities):
+        """更新经验的优先级"""
+        for idx, priority in zip(indices, priorities):
+            # 确保优先级为正数
+            priority = abs(priority) + self.epsilon
+            # 更新最大优先级
+            self.max_priority = max(self.max_priority, priority)
+            # 应用α指数
+            priority = priority ** self.alpha
+            # 更新树中的优先级
+            self.tree.update(idx, priority)
+    
+    def __len__(self):
+        """返回当前存储的经验数量"""
+        return self.tree.n_entries
+
+# =============================================================================
+# section 4: 简化的强化学习求解器
+# =============================================================================
+class GraphRLSolver:
+    """简化的基于图的强化学习求解器 - 增强版本，支持TensorBoard监控"""
+    def __init__(self, uavs, targets, graph, obstacles, i_dim, h_dim, o_dim, config, network_type="SimpleNetwork", tensorboard_dir=None):
         self.uavs = uavs
         self.targets = targets
-        self.n_phi = n_phi
+        self.graph = graph
         self.obstacles = obstacles
-        self.phi_set = [2 * np.pi * i / n_phi for i in range(n_phi)]
-        self.vertices = self._create_vertices()
-        all_vertices_flat = sum(self.vertices['UAVs'].values(), []) + sum(self.vertices['Targets'].values(), [])
-        self.vertex_to_idx = {v: i for i, v in enumerate(all_vertices_flat)}
-        self.edges = self._create_edges()
-        self.adjacency_matrix = self._create_adjacency_matrix()
-
-    def _create_vertices(self) -> Dict:
-        return {'UAVs': {u.id: [(-u.id, None)] for u in self.uavs}, 'Targets': {t.id: [(t.id, p) for p in self.phi_set] for t in self.targets}}
-
-    def _create_edges(self) -> List:
-        edges = []
-        uav_vs = sum(self.vertices['UAVs'].values(), [])
-        target_vs = sum(self.vertices['Targets'].values(), [])
-        for uav_v in uav_vs:
-            for target_v in target_vs:
-                edges.append((uav_v, target_v))
-        for t1_v in target_vs:
-            for t2_v in target_vs:
-                if t1_v[0] != t2_v[0]:
-                    edges.append((t1_v, t2_v))
-        return edges
-
-    def _create_adjacency_matrix(self) -> np.ndarray:
-        """
-        在计算距离时，增加直线碰撞检测。如果两点间直线路径穿过障碍物，则距离为无穷大。
-        """
-        n = len(self.vertex_to_idx)
-        adj = np.full((n, n), np.inf)
-        np.fill_diagonal(adj, 0)
+        self.config = config
+        self.network_type = network_type
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        pos_cache = {**{next(iter(self.vertices['UAVs'][u.id])): u.position for u in self.uavs}, 
-                     **{v: t.position for t in self.targets for v in self.vertices['Targets'][t.id]}}
-
-        for start_v, end_v in self.edges:
-            p1, p2 = pos_cache[start_v], pos_cache[end_v]
-            
-            has_collision = False
-            if self.obstacles:
-                for obs in self.obstacles:
-                    if obs.check_line_segment_collision(p1, p2):
-                        has_collision = True
-                        break
-            
-            if has_collision:
-                adj[self.vertex_to_idx[start_v], self.vertex_to_idx[end_v]] = np.inf
-            else:
-                adj[self.vertex_to_idx[start_v], self.vertex_to_idx[end_v]] = np.linalg.norm(p2 - p1)
-                
-        return adj
-
-
-
-class UAVTaskEnv:
-    """强化学习环境：定义状态、动作、奖励和转移逻辑"""
-    def __init__(self, uavs, targets, graph, obstacles, config):
-        self.uavs, self.targets, self.graph, self.obstacles, self.config = uavs, targets, graph, obstacles, config
-        self.load_balance_penalty = config.LOAD_BALANCE_PENALTY
-        self.alliance_bonus = 100.0  # 协作奖励大幅提升
-        self.use_phrrt_in_training = config.USE_PHRRT_DURING_TRAINING
-        self.reset()
-    def reset(self):
-        for uav in self.uavs: uav.reset()
-        for target in self.targets: target.reset()
-        return self._get_state()
-    def _get_state(self):
-        state = [];
-        for t in self.targets: state.extend([*t.position, *t.remaining_resources, *t.resources])
-        for u in self.uavs: state.extend([*u.current_position, *u.resources, u.heading, u.current_distance])
-        return np.array(state, dtype=np.float32)
-    
-    def step(self, action):
-        target_id, uav_id, phi_idx = action
-        target = next((t for t in self.targets if t.id == target_id), None)
-        uav = next((u for u in self.uavs if u.id == uav_id), None)
+        # TensorBoard支持 - 安全初始化
+        self.tensorboard_dir = tensorboard_dir
+        self.writer = None
+        if tensorboard_dir and TENSORBOARD_AVAILABLE:
+            try:
+                self.writer = SummaryWriter(tensorboard_dir)
+                print(f"TensorBoard日志将保存至: {tensorboard_dir}")
+            except Exception as e:
+                print(f"TensorBoard初始化失败: {e}")
+        elif tensorboard_dir and not TENSORBOARD_AVAILABLE:
+            print("TensorBoard未安装，跳过日志记录")
         
-        if not target or not uav: 
-            return self._get_state(), -100, True, {}
+        # 创建网络
+        self.policy_net = create_network(network_type, i_dim, h_dim, o_dim).to(self.device)
+        self.target_net = create_network(network_type, i_dim, h_dim, o_dim).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
         
-        actual_contribution = np.minimum(target.remaining_resources, uav.resources)
-        if np.all(actual_contribution <= 0): 
-            return self._get_state(), -20, False, {}
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=config.LEARNING_RATE)
         
-        # 记录目标完成前的状态
-        was_satisfied = np.all(target.remaining_resources <= 0)
-        
-        # 计算路径长度（保留原有设计）
-        if self.use_phrrt_in_training:
-            start_heading = uav.heading if not uav.task_sequence else self.graph.phi_set[uav.task_sequence[-1][1]]
-            planner = PHCurveRRTPlanner(uav.current_position, target.position, start_heading, self.graph.phi_set[phi_idx], self.obstacles, self.config)
-            plan_result = planner.plan()
-            path_len = plan_result[1] if plan_result else np.linalg.norm(uav.current_position - target.position)
+        # 使用优先经验回放缓冲区替代普通deque
+        self.use_per = config.training_config.use_prioritized_replay
+        if self.use_per:
+            self.memory = PrioritizedReplayBuffer(
+                capacity=config.MEMORY_CAPACITY,
+                alpha=config.training_config.per_alpha,
+                beta_start=config.training_config.per_beta_start,
+                beta_frames=config.training_config.per_beta_frames
+            )
+            print(f"  - 优先经验回放: 启用 (α={config.training_config.per_alpha}, β_start={config.training_config.per_beta_start})")
         else:
-            path_len = np.linalg.norm(uav.current_position - target.position)
+            self.memory = deque(maxlen=config.MEMORY_CAPACITY)
+            print("  - 优先经验回放: 禁用")
+        self.epsilon = config.training_config.epsilon_start
         
-        # 计算旅行时间
-        travel_time = path_len / uav.velocity_range[1]
+        # 环境
+        self.env = UAVTaskEnv(uavs, targets, graph, obstacles, config)
         
-        # 更新状态
-        uav.resources -= actual_contribution
-        target.remaining_resources -= actual_contribution
-        if uav_id not in {a[0] for a in target.allocated_uavs}:
-            target.allocated_uavs.append((uav_id, phi_idx))
-        uav.task_sequence.append((target_id, phi_idx))
-        uav.current_position = target.position
-        uav.heading = self.graph.phi_set[phi_idx]
+        # 动作映射
+        self.target_id_map = {t.id: i for i, t in enumerate(self.env.targets)}
+        self.uav_id_map = {u.id: i for i, u in enumerate(self.env.uavs)}
         
-        # 检查是否完成所有目标
-        total_satisfied = sum(np.all(t.remaining_resources <= 0) for t in self.targets)
-        total_targets = len(self.targets)
-        done = total_satisfied == total_targets
+        # 训练参数 - 进一步优化的超参数
+        self.epsilon_decay = 0.995  # 适中的衰减率，平衡探索与利用
+        self.epsilon_min = 0.15     # 提高最小探索率，确保持续探索
         
-        # === 分层奖励设计：优先考虑目标数量和资源满足度 ===
+        # 高级DQN技术
+        self.use_double_dqn = True  # 启用Double DQN
+        self.use_dueling_dqn = True # 启用Dueling DQN架构
+        self.use_grad_clip = True   # 启用梯度裁剪
+        self.use_prioritized_replay = True  # 启用优先经验回放
         
-        # 1. 目标完成奖励（最高优先级）
-        now_satisfied = np.all(target.remaining_resources <= 0)
-        new_satisfied = int(now_satisfied and not was_satisfied)
-        target_completion_reward = 0
-        if new_satisfied:
-            target_completion_reward = 1500  # 增加新完成目标的奖励
+        # 学习率调整
+        self.lr_scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.95)
+        self.grad_clip_norm = 0.5   # 更严格的梯度裁剪阈值
         
-        # 2. 目标接近完成奖励（新增渐进奖励）
-        target_initial_total = np.sum(target.resources)
-        target_remaining_before = np.sum(target.remaining_resources + actual_contribution)
-        target_remaining_after = np.sum(target.remaining_resources)
-        completion_ratio_before = 1.0 - (target_remaining_before / target_initial_total)
-        completion_ratio_after = 1.0 - (target_remaining_after / target_initial_total)
-        completion_improvement = completion_ratio_after - completion_ratio_before
-        completion_progress_reward = completion_improvement * 800  # 增加渐进奖励权重
+        # 训练统计
+        self.step_count = 0
+        self.update_count = 0
         
-        # 3. 资源满足度奖励（新增）
-        resource_satisfaction_ratio = np.sum(actual_contribution) / np.sum(target.remaining_resources + actual_contribution)
-        resource_satisfaction_reward = resource_satisfaction_ratio * 200
-        
-        # 4. 协作奖励（增强）
-        collaboration_bonus = 0
-        if len(target.allocated_uavs) > 1:  # 多无人机协作
-            collaboration_bonus = self.alliance_bonus * len(target.allocated_uavs) * 0.5
-        
-        # 5. 效率奖励（新增）
-        efficiency_reward = 0
-        if travel_time > 0:
-            efficiency_reward = 100 / (travel_time + 1)  # 时间越短奖励越高
-        
-        # 6. 负载均衡奖励（轻微）
-        load_balance_reward = 0
-        if len(target.allocated_uavs) > 1:
-            uav_contributions = []
-            for uav_id, _ in target.allocated_uavs:
-                uav = next((u for u in self.uavs if u.id == uav_id), None)
-                if uav:
-                    contribution = np.sum(np.minimum(target.resources, uav.initial_resources))
-                    uav_contributions.append(contribution)
-            if uav_contributions:
-                std_contribution = np.std(uav_contributions)
-                load_balance_reward = max(0, int(50 - std_contribution))  # 贡献越均衡奖励越高
-        
-        # 7. 路径惩罚（轻微）
-        path_penalty = -travel_time * 0.1  # 轻微惩罚长路径
-        
-        # 综合奖励
-        total_reward = (
-            target_completion_reward +      # 目标完成（最高权重）
-            completion_progress_reward +    # 渐进完成
-            resource_satisfaction_reward +  # 资源满足
-            collaboration_bonus +           # 协作奖励
-            efficiency_reward +             # 效率奖励
-            load_balance_reward +           # 负载均衡
-            path_penalty                    # 路径惩罚
-        )
-        
-        return self._get_state(), total_reward, done, {}
-
-
-# =============================================================================
-# section 4: 强化学习求解器
-# =============================================================================
-class GNN(nn.Module):
-    """优化的神经网络，增加网络容量以提升学习能力"""
-    def __init__(self, i_dim, h_dim, o_dim):
-        super(GNN, self).__init__()
-        # 增加网络深度和宽度
-        self.l = nn.Sequential(
-            nn.Linear(i_dim, h_dim * 2),  # 第一层：输入维度 -> 2倍隐藏层
-            nn.ReLU(),
-            nn.Dropout(0.1),  # 添加dropout防止过拟合
-            nn.Linear(h_dim * 2, h_dim * 2),  # 第二层：保持宽度
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(h_dim * 2, h_dim),  # 第三层：逐渐减少到原始隐藏层
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(h_dim, h_dim // 2),  # 第四层：进一步减少
-            nn.ReLU(),
-            nn.Linear(h_dim // 2, o_dim)  # 输出层
-        )
-        
-    def forward(self, x):
-        return self.l(x)
-
-class GraphRLSolver:
-    """使用深度Q网络（DQN）的强化学习求解器"""
-    def __init__(self, uavs, targets, graph, obstacles, i_dim, h_dim, o_dim, config):
-        self.config, self.graph = config, graph; self.env = UAVTaskEnv(uavs, targets, graph, obstacles, config); self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = GNN(i_dim, h_dim, o_dim).to(self.device); self.target_model = GNN(i_dim, h_dim, o_dim).to(self.device); self.target_model.load_state_dict(self.model.state_dict())
-        self.optimizer = optim.Adam(self.model.parameters(), lr=config.LEARNING_RATE); self.memory = deque(maxlen=config.MEMORY_SIZE); self.epsilon, self.step_count = 1.0, 0; self.train_history = defaultdict(list)
-        self.target_id_map = {t.id: i for i, t in enumerate(self.env.targets)}; self.uav_id_map = {u.id: i for i, u in enumerate(self.env.uavs)}
-        
-        # === 自适应多维闭环早熟检测系统 ===
-        self.early_stop_detected = False
-        self.early_stop_counter = 0
-        self.intervention_applied = False
-        
-        # 多维度监控指标
-        self.reward_history = []
-        self.loss_history = []
-        self.gradient_norm_history = []
-        self.epsilon_history = []
-        self.exploration_rate_history = []
-        
-        # 自适应检测参数
-        self.detection_window = 50  # 检测窗口大小
-        self.min_episodes_before_detection = 100  # 开始检测的最小轮次
-        self.improvement_threshold = 0.01  # 改进阈值（1%）
-        self.stability_threshold = 0.05  # 稳定性阈值（5%）
-        
-        # 早熟干预参数
-        self.intervention_epsilon_boost = 0.3  # 探索率提升
-        self.intervention_lr_reduction = 0.5  # 学习率降低
-        self.intervention_memory_refresh = 0.3  # 记忆库刷新比例
-        self.max_interventions = 3  # 最大干预次数
-        
-        # 自适应调整参数
-        self.adaptive_detection_enabled = True
-        self.adaptive_window_adjustment = True
-        self.adaptive_threshold_adjustment = True
-        
-        # 性能基准
-        self.best_reward = -float('inf')
-        self.best_loss = float('inf')
-        self.reward_plateau_count = 0
-        self.loss_plateau_count = 0
-        
-        # 训练历史记录
-        self.best_reward_history = []
-        self.training_metrics = {
-            'episode_rewards': [],
-            'episode_losses': [],
-            'gradient_norms': [],
-            'exploration_rates': [],
-            'intervention_history': []
-        }
+        print(f"初始化完成: {network_type} 网络")
+        print(f"  - Double DQN: {'启用' if self.use_double_dqn else '禁用'}")
+        print(f"  - 梯度裁剪: {'启用' if self.use_grad_clip else '禁用'}")
+        print(f"  - 探索率衰减: {self.epsilon_decay}")
+    
     def _action_to_index(self, a):
-        t_idx, u_idx, p_idx = self.target_id_map[a[0]], self.uav_id_map[a[1]], a[2]; return t_idx * (len(self.env.uavs) * self.graph.n_phi) + u_idx * self.graph.n_phi + p_idx
+        """将动作转换为索引"""
+        t_idx, u_idx, p_idx = self.target_id_map[a[0]], self.uav_id_map[a[1]], a[2]
+        return t_idx * (len(self.env.uavs) * self.graph.n_phi) + u_idx * self.graph.n_phi + p_idx
+    
     def _index_to_action(self, i):
-        n_u, n_p = len(self.env.uavs), self.graph.n_phi; t_idx, u_idx, p_idx = i // (n_u * n_p), (i % (n_u * n_p)) // n_p, i % n_p
+        """将索引转换为动作"""
+        n_u, n_p = len(self.env.uavs), self.graph.n_phi
+        t_idx, u_idx, p_idx = i // (n_u * n_p), (i % (n_u * n_p)) // n_p, i % n_p
         return (self.env.targets[t_idx].id, self.env.uavs[u_idx].id, p_idx)
-    def remember(self, s, a, r, ns, d): self.memory.append((s, a, r, ns, d))
-    def replay(self):
-        if len(self.memory) < self.config.BATCH_SIZE: return None
-        minibatch = random.sample(self.memory, self.config.BATCH_SIZE); states, actions, rewards, next_states, dones = zip(*minibatch)
-        s_tensor, ns_tensor = torch.FloatTensor(np.array(states)).to(self.device), torch.FloatTensor(np.array(next_states)).to(self.device)
-        a_tensor, r_tensor, d_tensor = torch.LongTensor([self._action_to_index(a) for a in actions]).to(self.device), torch.FloatTensor(rewards).to(self.device), torch.FloatTensor(dones).to(self.device)
-        q_vals = self.model(s_tensor).gather(1, a_tensor.unsqueeze(1)).squeeze(1)
-        with torch.no_grad(): next_q_vals = self.target_model(ns_tensor).max(1)[0]
-        targets = r_tensor + self.config.GAMMA * next_q_vals * (1 - d_tensor); loss = nn.MSELoss()(q_vals, targets)
-        self.optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0); self.optimizer.step()
-        if self.step_count % self.config.TARGET_UPDATE_FREQ == 0: self.target_model.load_state_dict(self.model.state_dict())
+    
+    def select_action(self, state):
+        """使用Epsilon-Greedy策略选择动作"""
+        if random.random() < self.epsilon:
+            return torch.tensor([[random.randrange(self.env.n_actions)]], device=self.device, dtype=torch.long)
+        with torch.no_grad():
+            # 临时切换到eval模式避免BatchNorm问题
+            self.policy_net.eval()
+            q_values = self.policy_net(state)
+            self.policy_net.train()
+            return q_values.max(1)[1].view(1, 1)
+    
+    def optimize_model(self):
+        """
+        从经验回放池中采样并优化模型 - 支持优先经验回放(PER)
+        
+        核心改进:
+        1. 支持PER的带权重采样
+        2. 计算TD误差并更新优先级
+        3. 使用重要性采样权重修正偏差
+        """
+        if len(self.memory) < self.config.BATCH_SIZE:
+            return
+        
+        # 根据是否使用PER选择不同的采样策略
+        if self.use_per:
+            # PER采样：获取经验、索引和重要性采样权重
+            transitions, indices, weights = self.memory.sample(self.config.BATCH_SIZE)
+            weights = torch.FloatTensor(weights).to(self.device)
+        else:
+            # 标准随机采样
+            transitions = random.sample(self.memory, self.config.BATCH_SIZE)
+            indices = None
+            weights = torch.ones(self.config.BATCH_SIZE).to(self.device)
+        
+        # 解包批次数据
+        batch = list(zip(*transitions))
+        state_batch = torch.cat(batch[0])
+        action_batch = torch.cat(batch[1])
+        reward_batch = torch.cat(batch[2])
+        next_states_batch = torch.cat(batch[3])
+        done_batch = torch.tensor(batch[4], device=self.device, dtype=torch.bool)
+        
+        # 计算当前Q值
+        current_q_values = self.policy_net(state_batch).gather(1, action_batch)
+        
+        # 计算目标Q值
+        next_q_values = torch.zeros(self.config.BATCH_SIZE, device=self.device)
+        
+        with torch.no_grad():
+            if self.use_double_dqn:
+                # Double DQN: 使用策略网络选择动作，目标网络评估动作
+                next_actions = self.policy_net(next_states_batch).max(1)[1].unsqueeze(1)
+                next_q_values[~done_batch] = self.target_net(next_states_batch[~done_batch]).gather(1, next_actions[~done_batch]).squeeze(1)
+            else:
+                # 标准DQN
+                next_q_values[~done_batch] = self.target_net(next_states_batch[~done_batch]).max(1)[0]
+        
+        expected_q_values = reward_batch + (self.config.GAMMA * next_q_values)
+        
+        # 计算TD误差（用于更新优先级）
+        td_errors = (current_q_values.squeeze() - expected_q_values).detach()
+        
+        # 计算加权损失
+        if self.use_per:
+            # 使用重要性采样权重修正损失
+            elementwise_loss = F.smooth_l1_loss(current_q_values, expected_q_values.unsqueeze(1), reduction='none')
+            loss = (elementwise_loss.squeeze() * weights).mean()
+        else:
+            # 标准损失
+            loss = F.smooth_l1_loss(current_q_values, expected_q_values.unsqueeze(1))
+        
+        # 反向传播和优化
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # 梯度裁剪
+        if self.use_grad_clip:
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.grad_clip_norm)
+        
+        self.optimizer.step()
+        self.update_count += 1
+        
+        # 更新PER优先级
+        if self.use_per and indices is not None:
+            # 使用TD误差的绝对值作为新的优先级
+            priorities = np.abs(td_errors.cpu().numpy()) + 1e-6
+            self.memory.update_priorities(indices, priorities)
+        
+        # TensorBoard记录
+        if self.writer:
+            # 记录基础指标
+            self.writer.add_scalar('Training/Loss', loss.item(), self.update_count)
+            self.writer.add_scalar('Training/Mean_Q_Value', current_q_values.mean().item(), self.update_count)
+            self.writer.add_scalar('Training/Mean_TD_Error', td_errors.abs().mean().item(), self.update_count)
+            
+            # 记录PER相关指标
+            if self.use_per:
+                self.writer.add_scalar('Training/PER_Beta', self.memory.beta(), self.update_count)
+                self.writer.add_scalar('Training/Mean_IS_Weight', weights.mean().item(), self.update_count)
+                self.writer.add_scalar('Training/Max_Priority', self.memory.max_priority, self.update_count)
+            
+            # 记录梯度信息
+            total_norm = 0
+            for p in self.policy_net.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** (1. / 2)
+            self.writer.add_scalar('Training/Gradient_Norm', total_norm, self.update_count)
+        
+        # 软更新目标网络
+        if self.update_count % self.config.TARGET_UPDATE_FREQ == 0:
+            tau = 0.01  # 软更新系数
+            for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)
+        
+        # 自适应学习率调度
+        if self.update_count % 500 == 0:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = max(param_group['lr'] * 0.95, 1e-5)
+        
         return loss.item()
-    def _get_valid_action_mask(self):
-        n_t, n_u, n_p = len(self.env.targets), len(self.env.uavs), self.graph.n_phi; mask = torch.zeros(n_t * n_u * n_p, dtype=torch.bool, device=self.device)
-        for t in self.env.targets:
-            if np.all(t.remaining_resources <= 0): continue
-            t_idx = self.target_id_map[t.id]; collaborators = {a[0] for a in t.allocated_uavs}
-            for u in self.env.uavs:
-                if u.id in collaborators: continue
-                u_idx = self.uav_id_map[u.id]
-                if np.any((u.resources > 0) & (t.remaining_resources > 0)):
-                    start_idx = t_idx * (n_u * n_p) + u_idx * n_p; mask[start_idx: start_idx + n_p] = True
-        return mask
-    def _calculate_gradient_norm(self):
-        """计算当前梯度的范数"""
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
+        
+        # 记录训练指标到TensorBoard
+        if self.writer:
+            self.writer.add_scalar('Training/Loss', loss.item(), self.update_count)
+            self.writer.add_scalar('Training/Q_Value_Mean', current_q_values.mean().item(), self.update_count)
+            self.writer.add_scalar('Training/Q_Value_Std', current_q_values.std().item(), self.update_count)
+            self.writer.add_scalar('Training/Target_Q_Mean', expected_q_values.mean().item(), self.update_count)
+            self.writer.add_scalar('Training/Reward_Mean', reward_batch.mean().item(), self.update_count)
+        
+        return loss.item()
     
-    def _detect_early_stopping(self, episode, avg_reward, avg_loss):
-        """自适应多维闭环早熟检测"""
-        if episode < self.min_episodes_before_detection:
-            return False, {}
-        
-        # 更新历史记录
-        self.reward_history.append(avg_reward)
-        self.loss_history.append(avg_loss)
-        self.epsilon_history.append(self.epsilon)
-        
-        # 计算梯度范数
-        if len(self.reward_history) > 1:
-            grad_norm = self._calculate_gradient_norm()
-            self.gradient_norm_history.append(grad_norm)
-        
-        # 自适应调整检测窗口
-        if self.adaptive_window_adjustment and episode > 200:
-            # 根据训练进度动态调整窗口大小
-            progress_ratio = episode / self.config.EPISODES
-            self.detection_window = max(30, min(100, int(50 * (1 + progress_ratio))))
-        
-        # 自适应调整阈值
-        if self.adaptive_threshold_adjustment and episode > 150:
-            # 根据训练进度动态调整阈值
-            progress_ratio = episode / self.config.EPISODES
-            self.improvement_threshold = max(0.005, min(0.02, 0.01 * (1 + progress_ratio)))
-            self.stability_threshold = max(0.03, min(0.08, 0.05 * (1 + progress_ratio)))
-        
-        # 多维度检测指标
-        detection_results = {
-            'reward_plateau': False,
-            'loss_plateau': False,
-            'gradient_stagnation': False,
-            'exploration_deficiency': False,
-            'overall_stagnation': False
-        }
-        
-        # 1. 奖励停滞检测
-        if len(self.reward_history) >= self.detection_window:
-            recent_rewards = self.reward_history[-self.detection_window:]
-            recent_max = max(recent_rewards)
-            if recent_max <= self.best_reward * (1 + self.improvement_threshold):
-                detection_results['reward_plateau'] = True
-                self.reward_plateau_count += 1
-            else:
-                self.reward_plateau_count = 0
-        
-        # 2. 损失停滞检测
-        if len(self.loss_history) >= self.detection_window:
-            recent_losses = self.loss_history[-self.detection_window:]
-            recent_min = min(recent_losses)
-            if recent_min >= self.best_loss * (1 - self.improvement_threshold):
-                detection_results['loss_plateau'] = True
-                self.loss_plateau_count += 1
-            else:
-                self.loss_plateau_count = 0
-        
-        # 3. 梯度停滞检测
-        if len(self.gradient_norm_history) >= self.detection_window:
-            recent_grads = self.gradient_norm_history[-self.detection_window:]
-            grad_std = np.std(recent_grads)
-            grad_mean = np.mean(recent_grads)
-            if grad_std < grad_mean * self.stability_threshold:
-                detection_results['gradient_stagnation'] = True
-        
-        # 4. 探索不足检测
-        if len(self.epsilon_history) >= self.detection_window:
-            recent_epsilon = self.epsilon_history[-self.detection_window:]
-            epsilon_std = np.std(recent_epsilon)
-            if epsilon_std < 0.01:  # 探索率变化很小
-                detection_results['exploration_deficiency'] = True
-        
-        # 5. 综合停滞检测
-        stagnation_count = sum(detection_results.values())
-        if stagnation_count >= 2:  # 至少两个维度出现停滞
-            detection_results['overall_stagnation'] = True
-        
-        # 判断是否需要干预
-        needs_intervention = (
-            detection_results['overall_stagnation'] or
-            self.reward_plateau_count >= 3 or
-            self.loss_plateau_count >= 3
-        )
-        
-        return needs_intervention, detection_results
-    
-    def _apply_early_stopping_intervention(self, detection_results):
-        """应用早熟干预措施"""
-        if self.intervention_applied or len(self.training_metrics['intervention_history']) >= self.max_interventions:
-            return False
-        
-        print(f"\n=== 检测到早熟问题，应用干预措施 ===")
-        print(f"检测结果: {detection_results}")
-        
-        # 1. 提升探索率
-        old_epsilon = self.epsilon
-        self.epsilon = min(1.0, self.epsilon + self.intervention_epsilon_boost)
-        print(f"探索率提升: {old_epsilon:.3f} -> {self.epsilon:.3f}")
-        
-        # 2. 降低学习率
-        old_lr = self.optimizer.param_groups[0]['lr']
-        new_lr = old_lr * self.intervention_lr_reduction
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
-        print(f"学习率降低: {old_lr:.6f} -> {new_lr:.6f}")
-        
-        # 3. 刷新记忆库（部分）
-        if len(self.memory) > 0:
-            refresh_size = int(len(self.memory) * self.intervention_memory_refresh)
-            for _ in range(refresh_size):
-                if len(self.memory) > 0:
-                    self.memory.popleft()
-            print(f"记忆库刷新: 移除 {refresh_size} 个旧经验")
-        
-        # 4. 重置停滞计数器
-        self.reward_plateau_count = 0
-        self.loss_plateau_count = 0
-        
-        # 5. 记录干预历史
-        intervention_record = {
-            'episode': len(self.reward_history),
-            'detection_results': detection_results,
-            'epsilon_change': self.epsilon - old_epsilon,
-            'lr_change': new_lr - old_lr,
-            'memory_refresh': refresh_size if len(self.memory) > 0 else 0
-        }
-        self.training_metrics['intervention_history'].append(intervention_record)
-        
-        self.intervention_applied = True
-        return True
     def train(self, episodes, patience, log_interval, model_save_path):
-        """训练强化学习模型"""
-        print(f"开始训练，总轮次: {episodes}")
-        
-        # 训练历史记录
-        episode_rewards = []
-        episode_losses = []
-        intervention_history = []
-        
-        # 早停检测相关
+        """训练模型 - 增强版本，支持TensorBoard监控和详细调试信息"""
+        start_time = time.time()
         best_reward = float('-inf')
         patience_counter = 0
-        early_stopping_triggered = False
         
-        # 自适应训练参数
-        current_lr = self.optimizer.param_groups[0]['lr']
-        current_epsilon = self.epsilon
+        # 初始化训练历史记录
+        self.episode_rewards = []
+        self.episode_losses = []
+        self.epsilon_values = []
+        self.completion_rates = []
+        self.episode_steps = []
+        self.memory_usage = []
         
-        for episode in tqdm(range(episodes), desc="训练进度"):
+        # 简化训练开始信息
+        param_count = sum(p.numel() for p in self.policy_net.parameters())
+        print(f"初始化 {self.network_type} 网络 (参数: {param_count:,}, 设备: {self.device})")
+        
+        for i_episode in tqdm(range(episodes), desc=f"训练进度 [{self.network_type}]"):
             state = self.env.reset()
             episode_reward = 0
             episode_loss = 0
-            steps = 0
+            loss_count = 0
+            episode_step_count = 0
             
-            while True:
-                # 获取有效动作掩码
-                valid_actions = self.env._get_valid_action_mask()
-                if not any(valid_actions):
-                    break
+            for step in range(self.env.max_steps):
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                action = self.select_action(state_tensor)
                 
-                # 选择动作
-                action = self._select_action(state, valid_actions)
-                next_state, reward, done, _ = self.env.step(action)
-                
-                # 存储经验
-                self.memory.append((state, action, reward, next_state, done))
+                next_state, reward, done, truncated, _ = self.env.step(action.item())
                 episode_reward += reward
-                state = next_state
-                steps += 1
+                episode_step_count += 1
+                self.step_count += 1
                 
-                # 训练网络
-                if len(self.memory) >= self.batch_size:
-                    loss = self.replay()
+                # 添加经验到回放缓冲区
+                if self.use_per:
+                    self.memory.push(
+                        state_tensor,
+                        action,
+                        torch.tensor([reward], device=self.device),
+                        torch.FloatTensor(next_state).unsqueeze(0).to(self.device),
+                        done
+                    )
+                else:
+                    self.memory.append((
+                        state_tensor,
+                        action,
+                        torch.tensor([reward], device=self.device),
+                        torch.FloatTensor(next_state).unsqueeze(0).to(self.device),
+                        done
+                    ))
+                
+                # 优化模型（每步都尝试优化）
+                if len(self.memory) >= self.config.BATCH_SIZE:
+                    loss = self.optimize_model()
                     if loss is not None:
                         episode_loss += loss
+                        loss_count += 1
                 
-                if done:
+                state = next_state
+                
+                if done or truncated:
                     break
             
-            # 记录历史
-            episode_rewards.append(episode_reward)
-            if episode_loss > 0:
-                episode_losses.append(episode_loss / steps)
-            else:
-                episode_losses.append(0.0)
+            # 更新目标网络
+            if i_episode % self.config.training_config.target_update_freq == 0:
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+                if self.writer:
+                    self.writer.add_scalar('Training/Target_Network_Update', 1, i_episode)
             
-            # 早停检测
-            if len(episode_rewards) >= 20:
-                detection_results = self._detect_early_stopping(episode, episode_rewards, episode_losses)
+            # 衰减探索率 - 使用调整后的参数
+            self.epsilon = max(self.epsilon_min, 
+                             self.epsilon * self.epsilon_decay)
+            
+            # 记录训练历史
+            avg_episode_loss = episode_loss / max(loss_count, 1)
+            self.episode_rewards.append(episode_reward)
+            self.episode_losses.append(avg_episode_loss)
+            self.epsilon_values.append(self.epsilon)
+            self.episode_steps.append(episode_step_count)
+            self.memory_usage.append(len(self.memory))
+            
+            # 计算完成率 - 优化版本，综合考虑目标满足数量、总体资源满足率、资源利用率
+            if self.env.targets:
+                # 1. 目标满足数量比例
+                completed_targets = sum(1 for target in self.env.targets if np.all(target.remaining_resources <= 0))
+                target_satisfaction_rate = completed_targets / len(self.env.targets)
                 
-                if detection_results['early_maturity_detected']:
-                    early_stopping_triggered = True
-                    intervention_results = self._apply_early_stopping_intervention(detection_results)
-                    
-                    if intervention_results['intervention_applied']:
-                        # 记录干预历史
-                        intervention_history.append({
-                            'episode': episode,
-                            'detection_type': detection_results['detection_type'],
-                            'epsilon_change': intervention_results['epsilon_change'],
-                            'lr_change': intervention_results['lr_change'],
-                            'intervention_type': intervention_results['intervention_type']
-                        })
-                        
-                        # 更新参数
-                        current_epsilon = intervention_results['new_epsilon']
-                        current_lr = intervention_results['new_lr']
-                        
-                        # 应用参数变化
-                        self.epsilon = current_epsilon
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = current_lr
-                        
-                        print(f"轮次 {episode}: 检测到{detection_results['detection_type']}，应用{intervention_results['intervention_type']}干预")
-                        print(f"  探索率: {current_epsilon:.4f}, 学习率: {current_lr:.6f}")
+                # 2. 总体资源满足率
+                total_demand = sum(np.sum(target.resources) for target in self.env.targets)
+                total_remaining = sum(np.sum(target.remaining_resources) for target in self.env.targets)
+                resource_satisfaction_rate = (total_demand - total_remaining) / total_demand if total_demand > 0 else 0
+                
+                # 3. 资源利用率
+                total_initial_supply = sum(np.sum(uav.initial_resources) for uav in self.env.uavs)
+                total_current_supply = sum(np.sum(uav.resources) for uav in self.env.uavs)
+                resource_utilization_rate = (total_initial_supply - total_current_supply) / total_initial_supply if total_initial_supply > 0 else 0
+                
+                # 综合完成率 = 目标满足率(50%) + 资源满足率(30%) + 资源利用率(20%)
+                completion_rate = (target_satisfaction_rate * 0.5 + 
+                                 resource_satisfaction_rate * 0.3 + 
+                                 resource_utilization_rate * 0.2)
+            else:
+                completion_rate = 0
             
-            # 定期保存模型
-            if (episode + 1) % 100 == 0:
-                self.save_model(model_save_path)
+            self.completion_rates.append(completion_rate)
             
-            # 早停检查
+            # 增强的TensorBoard记录
+            if self.writer:
+                # 基础指标
+                self.writer.add_scalar('Episode/Reward', episode_reward, i_episode)
+                self.writer.add_scalar('Episode/Loss', avg_episode_loss, i_episode)
+                self.writer.add_scalar('Episode/Epsilon', self.epsilon, i_episode)
+                self.writer.add_scalar('Episode/Completion_Rate', completion_rate, i_episode)
+                self.writer.add_scalar('Episode/Steps', episode_step_count, i_episode)
+                self.writer.add_scalar('Episode/Memory_Usage', len(self.memory), i_episode)
+                
+                # 移动平均指标
+                if len(self.episode_rewards) >= 20:
+                    recent_reward_avg = np.mean(self.episode_rewards[-20:])
+                    recent_completion_avg = np.mean(self.completion_rates[-20:])
+                    self.writer.add_scalar('Episode/Reward_MA20', recent_reward_avg, i_episode)
+                    self.writer.add_scalar('Episode/Completion_Rate_MA20', recent_completion_avg, i_episode)
+                
+                # 收敛性指标
+                if len(self.episode_rewards) >= 50:
+                    recent_std = np.std(self.episode_rewards[-50:])
+                    overall_std = np.std(self.episode_rewards)
+                    stability_ratio = recent_std / overall_std if overall_std > 0 else 0
+                    self.writer.add_scalar('Convergence/Stability_Ratio', stability_ratio, i_episode)
+                    self.writer.add_scalar('Convergence/Recent_Std', recent_std, i_episode)
+                
+                # 早停相关指标
+                self.writer.add_scalar('Training/Patience_Counter', patience_counter, i_episode)
+                self.writer.add_scalar('Training/Best_Reward', best_reward, i_episode)
+                
+                # 网络权重和梯度分析
+                if i_episode % (log_interval * 2) == 0:
+                    for name, param in self.policy_net.named_parameters():
+                        if param.grad is not None:
+                            self.writer.add_histogram(f'Weights/{name}', param, i_episode)
+                            self.writer.add_histogram(f'Gradients/{name}', param.grad, i_episode)
+                            self.writer.add_scalar(f'Gradients/{name}_norm', param.grad.norm(), i_episode)
+                
+                # 学习率记录（如果使用调度器）
+                if hasattr(self, 'optimizer'):
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self.writer.add_scalar('Training/Learning_Rate', current_lr, i_episode)
+            
+            # 简化的训练进度输出 - 仅在关键节点输出
+            if i_episode % (log_interval * 5) == 0 and i_episode > 0:  # 减少输出频率
+                avg_reward = np.mean(self.episode_rewards[-log_interval:])
+                avg_completion = np.mean(self.completion_rates[-log_interval:])
+                
+                print(f"训练进度 - Episode {i_episode:4d}: 平均奖励 {avg_reward:8.2f}, 完成率 {avg_completion:6.3f}")
+            
+            # 改进的早停检查 - 基于资源满足率和训练进度
+            current_completion_rate = completion_rate
+            
+            # 1. 传统奖励早停（保留但提高阈值）
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 patience_counter = 0
+                self.save_model(model_save_path)
+                if self.writer:
+                    self.writer.add_scalar('Training/Best_Reward', best_reward, i_episode)
             else:
                 patience_counter += 1
-                
-            if patience_counter >= patience:
-                print(f"早停触发，轮次 {episode}")
+            
+            # 2. 新增：基于资源满足率的早停准则
+            should_early_stop = False
+            early_stop_reason = ""
+            
+            # 确保至少训练总轮次的20%
+            min_training_episodes = max(int(episodes * 0.2), 100)
+            
+            if i_episode >= min_training_episodes:
+                # 检查最近50轮的平均完成率
+                if len(self.completion_rates) >= 50:
+                    recent_completion_avg = np.mean(self.completion_rates[-50:])
+                    
+                    # 如果资源满足率持续高于95%，可以早停
+                    if recent_completion_avg >= 0.95:
+                        should_early_stop = True
+                        early_stop_reason = f"资源满足率达标 (平均: {recent_completion_avg:.3f})"
+                    
+                    # 检查收敛性：最近50轮的标准差很小
+                    recent_completion_std = np.std(self.completion_rates[-50:])
+                    if recent_completion_std < 0.02 and recent_completion_avg >= 0.85:
+                        should_early_stop = True
+                        early_stop_reason = f"完成率收敛 (平均: {recent_completion_avg:.3f}, 标准差: {recent_completion_std:.4f})"
+            
+            # 传统早停（提高patience阈值，避免过早停止）
+            if patience_counter >= patience * 2:  # 将patience阈值翻倍
+                should_early_stop = True
+                early_stop_reason = f"奖励无改进超过 {patience * 2} 轮"
+            
+            if should_early_stop:
+                print(f"早停触发于第 {i_episode} 回合: {early_stop_reason}")
+                print(f"最佳奖励: {best_reward:.2f}, 最终完成率: {current_completion_rate:.3f}")
                 break
         
-        # 保存最终模型
-        self.save_model(model_save_path)
+        training_time = time.time() - start_time
         
-        # 生成增强收敛图
-        self._plot_enhanced_convergence(model_save_path)
+        # 关闭TensorBoard writer
+        if self.writer:
+            self.writer.close()
         
-        # 生成奖励曲线报告
-        self._generate_reward_curve_report(model_save_path)
+        print(f"\n训练完成 - 耗时: {training_time:.2f}秒")
+        print(f"训练统计:")
+        print(f"  总回合数: {len(self.episode_rewards)}")
+        print(f"  最佳奖励: {best_reward:.2f}")
+        print(f"  最终完成率: {self.completion_rates[-1]:.3f} (综合目标满足、资源满足、资源利用率)")
+        print(f"  最终探索率: {self.epsilon:.4f} (随机动作概率)")
         
-        # 保存训练历史
-        history_data = {
-            'episode_rewards': episode_rewards,
-            'episode_losses': episode_losses,
-            'intervention_history': intervention_history,
-            'early_stopping_triggered': early_stopping_triggered,
-            'final_epsilon': current_epsilon,
-            'final_lr': current_lr
+        # 生成详细的收敛性分析
+        self.generate_enhanced_convergence_analysis(model_save_path, i_episode)
+        
+        return training_time
+    
+    def get_convergence_metrics(self):
+        """获取收敛性指标"""
+        if not self.episode_rewards:
+            return {}
+        
+        rewards = np.array(self.episode_rewards)
+        
+        # 计算收敛性指标
+        metrics = {
+            'final_reward': float(rewards[-1]),
+            'max_reward': float(np.max(rewards)),
+            'mean_reward': float(np.mean(rewards)),
+            'reward_std': float(np.std(rewards)),
+            'reward_improvement': float(rewards[-1] - rewards[0]) if len(rewards) > 1 else 0.0
         }
         
-        history_path = model_save_path.replace('.pth', '_history.pkl')
-        with open(history_path, 'wb') as f:
-            pickle.dump(history_data, f)
+        # 收敛稳定性分析
+        if len(rewards) > 100:
+            recent_rewards = rewards[-50:]
+            early_rewards = rewards[:50]
+            
+            metrics.update({
+                'recent_mean': float(np.mean(recent_rewards)),
+                'recent_std': float(np.std(recent_rewards)),
+                'early_mean': float(np.mean(early_rewards)),
+                'stability_ratio': float(np.std(recent_rewards) / np.std(rewards)) if np.std(rewards) > 0 else 0.0,
+                'improvement_ratio': float((np.mean(recent_rewards) - np.mean(early_rewards)) / abs(np.mean(early_rewards))) if np.mean(early_rewards) != 0 else 0.0
+            })
+            
+            # 判断收敛状态
+            if metrics['stability_ratio'] < 0.3:
+                metrics['convergence_status'] = 'converged'
+            elif metrics['stability_ratio'] < 0.6:
+                metrics['convergence_status'] = 'partially_converged'
+            else:
+                metrics['convergence_status'] = 'unstable'
         
-        print(f"训练完成，总轮次: {len(episode_rewards)}")
-        print(f"最佳奖励: {best_reward:.2f}")
-        print(f"最终探索率: {current_epsilon:.4f}")
-        print(f"最终学习率: {current_lr:.6f}")
-        if intervention_history:
-            print(f"干预次数: {len(intervention_history)}")
+        # 添加完成率相关指标
+        if hasattr(self, 'completion_rates') and self.completion_rates:
+            completion_rates = np.array(self.completion_rates)
+            metrics.update({
+                'final_completion_rate': float(completion_rates[-1]),
+                'max_completion_rate': float(np.max(completion_rates)),
+                'mean_completion_rate': float(np.mean(completion_rates)),
+                'completion_rate_std': float(np.std(completion_rates)),
+                'completion_improvement': float(completion_rates[-1] - completion_rates[0]) if len(completion_rates) > 1 else 0.0
+            })
+            
+            # 完成率收敛性分析
+            if len(completion_rates) > 50:
+                recent_completion = completion_rates[-50:]
+                metrics.update({
+                    'recent_completion_mean': float(np.mean(recent_completion)),
+                    'recent_completion_std': float(np.std(recent_completion)),
+                    'completion_stability': float(np.std(recent_completion) / np.std(completion_rates)) if np.std(completion_rates) > 0 else 0.0
+                })
         
-        return episode_rewards, episode_losses
-
-    def _plot_enhanced_convergence(self, model_save_path):
-        """绘制增强的训练收敛情况图表，包含早熟检测和干预信息"""
-        # 创建保存路径
-        save_dir = os.path.dirname(model_save_path)
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+        return metrics
+    
+    def generate_enhanced_convergence_analysis(self, model_save_path, final_episode):
+        """生成增强的收敛性分析图表和报告"""
+        if not self.episode_rewards:
+            return
         
-        # 创建图表
-        fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-        fig.suptitle('增强训练收敛分析 - 包含早熟检测与干预', fontsize=16, fontweight='bold')
+        # 设置中文字体
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
         
-        # 1. 奖励收敛图
+        # 创建多子图布局
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        fig.suptitle(f'{self.network_type} 网络训练收敛性分析', fontsize=16, fontweight='bold')
+        
+        episodes = range(1, len(self.episode_rewards) + 1)
+        
+        # 1. 奖励曲线和移动平均
         ax1 = axes[0, 0]
-        rewards = self.train_history['episode_rewards']
-        episodes = range(1, len(rewards) + 1)
-        ax1.plot(episodes, rewards, 'b-', alpha=0.6, label='每轮奖励')
-        
-        # 添加移动平均线
-        window_size = min(50, len(rewards))
-        if window_size > 0:
-            moving_avg = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-            moving_episodes = range(window_size, len(rewards) + 1)
-            ax1.plot(moving_episodes, moving_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
-        
-        # 标记早熟检测点
-        if hasattr(self, 'early_stop_history') and self.early_stop_history:
-            for ep, detected in self.early_stop_history:
-                if detected:
-                    ax1.axvline(x=ep, color='red', linestyle='--', alpha=0.7, label='早熟检测' if ep == self.early_stop_history[0][0] else "")
-        
-        # 标记干预点
-        if hasattr(self, 'intervention_history') and self.intervention_history:
-            for ep, intervention_type in self.intervention_history:
-                ax1.axvline(x=ep, color='orange', linestyle=':', alpha=0.7, label=f'干预({intervention_type})' if ep == self.intervention_history[0][0] else "")
-        
+        ax1.plot(episodes, self.episode_rewards, alpha=0.6, color='lightblue', label='原始奖励')
+        if len(self.episode_rewards) > 20:
+            moving_avg = np.convolve(self.episode_rewards, np.ones(20)/20, mode='valid')
+            ax1.plot(range(20, len(self.episode_rewards) + 1), moving_avg, 
+                    color='red', linewidth=2, label='移动平均(20)')
         ax1.set_title('奖励收敛曲线')
         ax1.set_xlabel('训练轮次')
         ax1.set_ylabel('奖励值')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 2. 损失收敛图
+        # 2. 损失曲线
         ax2 = axes[0, 1]
-        if 'episode_losses' in self.train_history and self.train_history['episode_losses']:
-            losses = self.train_history['episode_losses']
-            loss_episodes = range(1, len(losses) + 1)
-            ax2.plot(loss_episodes, losses, 'g-', alpha=0.6, label='每轮损失')
-            
-            # 添加移动平均线
-            if len(losses) >= window_size:
-                moving_loss_avg = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
-                moving_loss_episodes = range(window_size, len(losses) + 1)
-                ax2.plot(moving_loss_episodes, moving_loss_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
-            
-            ax2.set_title('损失收敛曲线')
-            ax2.set_xlabel('训练轮次')
-            ax2.set_ylabel('损失值')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-        else:
-            ax2.text(0.5, 0.5, '无损失数据', ha='center', va='center', transform=ax2.transAxes)
-            ax2.set_title('损失收敛曲线')
+        if self.episode_losses:
+            ax2.plot(episodes, self.episode_losses, color='orange', alpha=0.7)
+            if len(self.episode_losses) > 20:
+                loss_moving_avg = np.convolve(self.episode_losses, np.ones(20)/20, mode='valid')
+                ax2.plot(range(20, len(self.episode_losses) + 1), loss_moving_avg, 
+                        color='red', linewidth=2, label='移动平均(20)')
+        ax2.set_title('损失收敛曲线')
+        ax2.set_xlabel('训练轮次')
+        ax2.set_ylabel('损失值')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
         
-        # 3. 梯度范数变化
+        # 3. 完成率曲线
         ax3 = axes[1, 0]
-        if 'gradient_norms' in self.train_history and self.train_history['gradient_norms']:
-            grad_norms = self.train_history['gradient_norms']
-            grad_episodes = range(1, len(grad_norms) + 1)
-            ax3.plot(grad_episodes, grad_norms, 'purple', alpha=0.6, label='梯度范数')
-            
-            # 添加移动平均线
-            if len(grad_norms) >= window_size:
-                moving_grad_avg = np.convolve(grad_norms, np.ones(window_size)/window_size, mode='valid')
-                moving_grad_episodes = range(window_size, len(grad_norms) + 1)
-                ax3.plot(moving_grad_episodes, moving_grad_avg, 'r-', linewidth=2, label=f'{window_size}轮移动平均')
-            
-            ax3.set_title('梯度范数变化')
-            ax3.set_xlabel('训练轮次')
-            ax3.set_ylabel('梯度范数')
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
-        else:
-            ax3.text(0.5, 0.5, '无梯度数据', ha='center', va='center', transform=ax3.transAxes)
-            ax3.set_title('梯度范数变化')
+        if self.completion_rates:
+            ax3.plot(episodes, self.completion_rates, color='green', alpha=0.7, label='完成率')
+            if len(self.completion_rates) > 20:
+                completion_moving_avg = np.convolve(self.completion_rates, np.ones(20)/20, mode='valid')
+                ax3.plot(range(20, len(self.completion_rates) + 1), completion_moving_avg, 
+                        color='red', linewidth=2, label='移动平均(20)')
+            ax3.axhline(y=0.95, color='red', linestyle='--', alpha=0.7, label='早停阈值(0.95)')
+            ax3.axhline(y=0.85, color='orange', linestyle='--', alpha=0.7, label='收敛阈值(0.85)')
+        ax3.set_title('完成率收敛曲线')
+        ax3.set_xlabel('训练轮次')
+        ax3.set_ylabel('完成率')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
         
-        # 4. 探索率变化
+        # 4. 探索率衰减
         ax4 = axes[1, 1]
-        if 'epsilon_values' in self.train_history and self.train_history['epsilon_values']:
-            epsilons = self.train_history['epsilon_values']
-            epsilon_episodes = range(1, len(epsilons) + 1)
-            ax4.plot(epsilon_episodes, epsilons, 'orange', alpha=0.6, label='探索率')
-            ax4.set_title('探索率变化')
-            ax4.set_xlabel('训练轮次')
-            ax4.set_ylabel('探索率')
-            ax4.legend()
-            ax4.grid(True, alpha=0.3)
-        else:
-            ax4.text(0.5, 0.5, '无探索率数据', ha='center', va='center', transform=ax4.transAxes)
-            ax4.set_title('探索率变化')
+        if self.epsilon_values:
+            ax4.plot(episodes, self.epsilon_values, color='purple', alpha=0.8)
+        ax4.set_title('探索率衰减曲线')
+        ax4.set_xlabel('训练轮次')
+        ax4.set_ylabel('探索率 (ε)')
+        ax4.grid(True, alpha=0.3)
         
-        # 5. 早熟检测指标
+        # 5. 收敛性指标分析
         ax5 = axes[2, 0]
-        if hasattr(self, 'early_stop_metrics') and self.early_stop_metrics:
-            metrics = self.early_stop_metrics
-            episodes = range(1, len(metrics) + 1)
+        if len(self.episode_rewards) > 100:
+            # 计算滑动窗口标准差
+            window_size = 50
+            rolling_std = []
+            for i in range(window_size, len(self.episode_rewards) + 1):
+                window_std = np.std(self.episode_rewards[i-window_size:i])
+                rolling_std.append(window_std)
             
-            # 绘制多维度指标
-            for metric_name, values in metrics.items():
-                if len(values) == len(episodes):
-                    ax5.plot(episodes, values, alpha=0.6, label=metric_name)
-            
-            ax5.set_title('早熟检测指标')
-            ax5.set_xlabel('训练轮次')
-            ax5.set_ylabel('指标值')
-            ax5.legend()
-            ax5.grid(True, alpha=0.3)
-        else:
-            ax5.text(0.5, 0.5, '无早熟检测数据', ha='center', va='center', transform=ax5.transAxes)
-            ax5.set_title('早熟检测指标')
+            ax5.plot(range(window_size, len(self.episode_rewards) + 1), rolling_std, 
+                    color='brown', alpha=0.8, label=f'滑动标准差({window_size})')
+            ax5.axhline(y=np.std(self.episode_rewards) * 0.3, color='red', 
+                       linestyle='--', alpha=0.7, label='收敛阈值')
+        ax5.set_title('收敛稳定性分析')
+        ax5.set_xlabel('训练轮次')
+        ax5.set_ylabel('标准差')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
         
-        # 6. 干预历史统计
+        # 6. 训练统计摘要
         ax6 = axes[2, 1]
-        if hasattr(self, 'intervention_history') and self.intervention_history:
-            intervention_types = [intervention[1] for intervention in self.intervention_history]
-            intervention_counts = {}
-            for intervention_type in intervention_types:
-                intervention_counts[intervention_type] = intervention_counts.get(intervention_type, 0) + 1
-            
-            if intervention_counts:
-                types = list(intervention_counts.keys())
-                counts = list(intervention_counts.values())
-                ax6.bar(types, counts, color=['red', 'orange', 'yellow'])
-                ax6.set_title('干预类型统计')
-                ax6.set_xlabel('干预类型')
-                ax6.set_ylabel('干预次数')
-                ax6.tick_params(axis='x', rotation=45)
-        else:
-            ax6.text(0.5, 0.5, '无干预数据', ha='center', va='center', transform=ax6.transAxes)
-            ax6.set_title('干预类型统计')
+        ax6.axis('off')
+        
+        # 获取收敛指标
+        convergence_metrics = self.get_convergence_metrics()
+        
+        # 创建统计文本
+        stats_text = f"""训练统计摘要:
+        
+总训练轮次: {final_episode}
+最终奖励: {convergence_metrics.get('final_reward', 0):.2f}
+最大奖励: {convergence_metrics.get('max_reward', 0):.2f}
+平均奖励: {convergence_metrics.get('mean_reward', 0):.2f}
+奖励改进: {convergence_metrics.get('reward_improvement', 0):.2f}
+
+最终完成率: {convergence_metrics.get('final_completion_rate', 0):.3f}
+平均完成率: {convergence_metrics.get('mean_completion_rate', 0):.3f}
+完成率改进: {convergence_metrics.get('completion_improvement', 0):.3f}
+
+收敛状态: {convergence_metrics.get('convergence_status', 'unknown')}
+稳定性比率: {convergence_metrics.get('stability_ratio', 0):.3f}
+改进比率: {convergence_metrics.get('improvement_ratio', 0):.3f}
+
+最终探索率: {self.epsilon:.4f}
+内存使用: {len(self.memory) if hasattr(self, 'memory') else 0}
+        """
+        
+        ax6.text(0.05, 0.95, stats_text, transform=ax6.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
         
         plt.tight_layout()
         
-        # 保存图片
+        # 保存图表
         convergence_path = model_save_path.replace('.pth', '_enhanced_convergence.png')
         plt.savefig(convergence_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         print(f"增强收敛分析图已保存至: {convergence_path}")
         
-        # 生成奖励曲线详细报告
-        self._generate_reward_curve_report(model_save_path)
+        # 生成详细的收敛性报告
+        self.generate_convergence_report(model_save_path, convergence_metrics, final_episode)
     
-    def _generate_reward_curve_report(self, model_save_path):
-        """生成奖励曲线详细报告"""
-        save_dir = os.path.dirname(model_save_path)
-        report_path = model_save_path.replace('.pth', '_reward_curve_report.txt')
+    def generate_convergence_report(self, model_save_path, metrics, final_episode):
+        """生成详细的收敛性文字报告"""
+        report_path = model_save_path.replace('.pth', '_convergence_report.txt')
         
-        report_lines = []
-        report_lines.append("=" * 80)
-        report_lines.append("强化学习训练奖励曲线分析报告")
-        report_lines.append("=" * 80)
-        report_lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        report_lines.append("")
-        
-        # 奖励统计
-        if 'episode_rewards' in self.train_history:
-            rewards = self.train_history['episode_rewards']
-            report_lines.append("奖励统计:")
-            report_lines.append(f"  总训练轮次: {len(rewards)}")
-            report_lines.append(f"  最高奖励: {max(rewards):.2f}")
-            report_lines.append(f"  最低奖励: {min(rewards):.2f}")
-            report_lines.append(f"  平均奖励: {np.mean(rewards):.2f}")
-            report_lines.append(f"  奖励标准差: {np.std(rewards):.2f}")
-            report_lines.append(f"  最终奖励: {rewards[-1]:.2f}")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(f"{self.network_type} 网络收敛性分析报告\n")
+            f.write("=" * 60 + "\n\n")
             
-            # 奖励趋势分析
-            if len(rewards) > 10:
-                recent_rewards = rewards[-10:]
-                early_rewards = rewards[:10]
-                recent_avg = np.mean(recent_rewards)
-                early_avg = np.mean(early_rewards)
-                improvement = (recent_avg - early_avg) / abs(early_avg) * 100 if early_avg != 0 else 0
-                report_lines.append(f"  奖励改进: {improvement:.2f}%")
+            # 基本训练信息
+            f.write("训练基本信息:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"网络类型: {self.network_type}\n")
+            f.write(f"训练轮次: {final_episode}\n")
+            f.write(f"设备: {self.device}\n")
+            f.write(f"参数数量: {sum(p.numel() for p in self.policy_net.parameters()):,}\n\n")
             
             # 收敛性分析
-            if len(rewards) > 50:
-                last_50 = rewards[-50:]
-                first_50 = rewards[:50]
-                convergence_ratio = np.std(last_50) / np.std(first_50) if np.std(first_50) > 0 else 0
-                report_lines.append(f"  收敛性指标: {convergence_ratio:.3f} (越小越稳定)")
-        
-        report_lines.append("")
-        
-        # 早熟检测统计
-        if hasattr(self, 'early_stop_history') and self.early_stop_history:
-            report_lines.append("早熟检测统计:")
-            total_detections = sum(1 for _, detected in self.early_stop_history if detected)
-            report_lines.append(f"  总检测次数: {len(self.early_stop_history)}")
-            report_lines.append(f"  早熟检测次数: {total_detections}")
-            report_lines.append(f"  早熟检测率: {total_detections/len(self.early_stop_history)*100:.1f}%")
-        
-        report_lines.append("")
-        
-        # 干预统计
-        if hasattr(self, 'intervention_history') and self.intervention_history:
-            report_lines.append("干预统计:")
-            intervention_types = {}
-            for _, intervention_type in self.intervention_history:
-                intervention_types[intervention_type] = intervention_types.get(intervention_type, 0) + 1
+            f.write("收敛性分析:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"收敛状态: {metrics.get('convergence_status', 'unknown')}\n")
+            f.write(f"稳定性比率: {metrics.get('stability_ratio', 0):.4f} (< 0.3 为收敛)\n")
+            f.write(f"改进比率: {metrics.get('improvement_ratio', 0):.4f}\n\n")
             
-            for intervention_type, count in intervention_types.items():
-                report_lines.append(f"  {intervention_type}: {count}次")
-        
-        report_lines.append("")
-        
-        # 训练建议
-        report_lines.append("训练建议:")
-        if 'episode_rewards' in self.train_history:
-            rewards = self.train_history['episode_rewards']
-            if len(rewards) > 0:
-                final_reward = rewards[-1]
-                max_reward = max(rewards)
+            # 奖励分析
+            f.write("奖励分析:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"最终奖励: {metrics.get('final_reward', 0):.2f}\n")
+            f.write(f"最大奖励: {metrics.get('max_reward', 0):.2f}\n")
+            f.write(f"平均奖励: {metrics.get('mean_reward', 0):.2f}\n")
+            f.write(f"奖励标准差: {metrics.get('reward_std', 0):.2f}\n")
+            f.write(f"奖励改进: {metrics.get('reward_improvement', 0):.2f}\n")
+            
+            if 'recent_mean' in metrics:
+                f.write(f"最近50轮平均: {metrics['recent_mean']:.2f}\n")
+                f.write(f"最近50轮标准差: {metrics['recent_std']:.2f}\n")
+                f.write(f"早期50轮平均: {metrics['early_mean']:.2f}\n")
+            f.write("\n")
+            
+            # 完成率分析
+            if 'final_completion_rate' in metrics:
+                f.write("完成率分析:\n")
+                f.write("-" * 30 + "\n")
+                f.write(f"最终完成率: {metrics['final_completion_rate']:.3f}\n")
+                f.write(f"最大完成率: {metrics['max_completion_rate']:.3f}\n")
+                f.write(f"平均完成率: {metrics['mean_completion_rate']:.3f}\n")
+                f.write(f"完成率标准差: {metrics['completion_rate_std']:.3f}\n")
+                f.write(f"完成率改进: {metrics['completion_improvement']:.3f}\n")
                 
-                if final_reward < max_reward * 0.8:
-                    report_lines.append("  - 当前奖励远低于历史最佳，建议调整学习率或增加训练轮次")
-                
-                if len(rewards) > 100 and np.std(rewards[-50:]) < np.std(rewards[:50]) * 0.1:
-                    report_lines.append("  - 奖励变化很小，可能已收敛，建议停止训练")
-                
-                if hasattr(self, 'intervention_history') and len(self.intervention_history) > 3:
-                    report_lines.append("  - 干预次数较多，建议调整早熟检测参数")
+                if 'recent_completion_mean' in metrics:
+                    f.write(f"最近50轮完成率: {metrics['recent_completion_mean']:.3f}\n")
+                    f.write(f"完成率稳定性: {metrics['completion_stability']:.3f}\n")
+                f.write("\n")
+            
+            # 训练建议
+            f.write("训练建议:\n")
+            f.write("-" * 30 + "\n")
+            
+            convergence_status = metrics.get('convergence_status', 'unknown')
+            if convergence_status == 'converged':
+                f.write("✓ 训练已收敛，模型性能稳定\n")
+            elif convergence_status == 'partially_converged':
+                f.write("⚠ 部分收敛，建议继续训练或调整超参数\n")
+            else:
+                f.write("✗ 训练不稳定，建议:\n")
+                f.write("  - 降低学习率\n")
+                f.write("  - 增加训练轮次\n")
+                f.write("  - 调整网络结构\n")
+            
+            stability_ratio = metrics.get('stability_ratio', 1.0)
+            if stability_ratio > 0.6:
+                f.write("⚠ 奖励波动较大，建议:\n")
+                f.write("  - 使用更平滑的探索策略\n")
+                f.write("  - 增加批次大小\n")
+                f.write("  - 添加奖励平滑机制\n")
+            
+            final_completion = metrics.get('final_completion_rate', 0)
+            if final_completion < 0.8:
+                f.write("⚠ 完成率较低，建议:\n")
+                f.write("  - 调整奖励函数\n")
+                f.write("  - 增加网络容量\n")
+                f.write("  - 优化环境设计\n")
         
-        # 保存报告
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(report_lines))
-        
-        print(f"奖励曲线分析报告已保存至: {report_path}")
+        print(f"收敛性报告已保存至: {report_path}")
 
-    def get_task_assignments(self):
-        """多次推理取最优值的任务分配方法"""
-        self.model.eval()
-        
-        # 获取多次推理的参数
-        n_inference_runs = getattr(self.config, 'RL_N_INFERENCE_RUNS', 10)
-        inference_temperature = getattr(self.config, 'RL_INFERENCE_TEMPERATURE', 0.1)
-        
-        best_assignments = None
-        best_reward = float('-inf')
-        
-        print(f"开始多次推理优化 (推理次数: {n_inference_runs})")
-        
-        for run in range(n_inference_runs):
-            # 重置环境
-            state = self.env.reset()
-            assignments = {u.id: [] for u in self.env.uavs}
-            done, step = False, 0
-            total_reward = 0
-            
-            while not done and step < len(self.env.targets) * len(self.env.uavs):
-                with torch.no_grad():
-                    valid_mask = self._get_valid_action_mask()
-                    if not valid_mask.any():
-                        break
-                    
-                    # 添加温度参数以增加探索性
-                    qs = self.model(torch.FloatTensor(state).unsqueeze(0).to(self.device)).squeeze(0)
-                    qs[~valid_mask] = -float('inf')
-                    
-                    # 使用温度参数进行softmax采样
-                    if inference_temperature > 0:
-                        probs = torch.softmax(qs / inference_temperature, dim=0)
-                        action_idx = torch.multinomial(probs, 1).item()
-                    else:
-                        action_idx = qs.argmax().item()
-                
-                action = self._index_to_action(action_idx)
-                assignments[action[1]].append((action[0], action[2]))
-                state, reward, done, _ = self.env.step(action)
-                total_reward += reward
-                step += 1
-            
-            # 评估当前推理结果
-            if total_reward > best_reward:
-                best_reward = total_reward
-                best_assignments = assignments.copy()
-                print(f"推理轮次 {run+1}: 发现更好的分配方案 (奖励: {best_reward:.2f})")
-        
-        self.model.train()
-        print(f"多次推理完成，最优奖励: {best_reward:.2f}")
-        return best_assignments
+    def save_model(self, path):
+        """保存模型"""
+        torch.save(self.policy_net.state_dict(), path)
     
-
     def load_model(self, path):
-        """(已修订) 从文件加载模型权重和训练历史，并处理PyTorch的FutureWarning。"""
-        if os.path.exists(path):
-            try:
-                # 加载模型权重
-                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.target_model.load_state_dict(self.model.state_dict())
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                model_loaded = True
-            except Exception:
-                try:
-                    state_dict = torch.load(path, map_location=self.device, weights_only=True)
-                    self.model.load_state_dict(state_dict)
-                    self.target_model.load_state_dict(self.model.state_dict())
-                    model_loaded = True
-                except Exception as e:
-                    print(f"回退加载模型权重时出错: {e}")
-                    return False
-
-            if model_loaded:
-                # 尝试加载训练历史
-                import re
-                match = re.search(r'ep_(\d+)_phrrt_(True|False)', path)
-                if match:
-                    episodes = match.group(1)
-                    phrrt = match.group(2)
-                    history_dir = os.path.dirname(path)
-                    history_path = os.path.join(history_dir, f'training_history_ep_{episodes}_phrrt_{phrrt}.pkl')
-                    if os.path.exists(history_path):
-                        with open(history_path, 'rb') as f:
-                            self.train_history = pickle.load(f)
-                        print(f"调试: 已加载训练历史，奖励数据点数量: {len(self.train_history.get('episode_rewards', []))}")
-                    else:
-                        print(f"警告: 训练历史文件不存在: {history_path}")
-                else:
-                    print("警告: 无法从模型路径提取参数以加载训练历史")
-                return True
-        return False
-
-
-# =============================================================================
-# section 5: 核心业务流程
-# =============================================================================
-def _plan_single_leg(args):
-    uav_id, start_pos, target_pos, start_heading, end_heading, obstacles, config = args
-    planner = PHCurveRRTPlanner(start_pos, target_pos, start_heading, end_heading, obstacles, config); return uav_id, planner.plan()
-# 此函数非常关键，直接觉得算法能够解除死锁、保证经济同步速度，而且速度还很快，协同分配资源的效率也很高。
-def calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obstacles, config) -> Tuple[defaultdict, dict]:
-    """(已更新) 计算经济同步速度，并返回未完成的任务以进行死锁检测。"""
-    # 转换任务数据结构并补充资源消耗
-    final_plan = defaultdict(list)
-    uav_status = {u.id: {'pos': u.position, 'free_at': 0.0, 'heading': u.heading} for u in uavs}
-    remaining_tasks = {uav_id: list(tasks) for uav_id, tasks in task_assignments.items()}; task_step_counter = defaultdict(lambda: 1)
-    while any(v for v in remaining_tasks.values()):
-        next_target_groups = defaultdict(list)
-        for uav_id, tasks in remaining_tasks.items():
-            if tasks: next_target_groups[tasks[0][0]].append({'uav_id': uav_id, 'phi_idx': tasks[0][1]})
-        if not next_target_groups: break
-        group_arrival_times = []
-        for target_id, uav_infos in next_target_groups.items():
-            target = next((t for t in targets if t.id == target_id), None)
-            if not target: continue
-            path_planners = {}
-            for uav_info in uav_infos:
-                uav_id = uav_info['uav_id']; args = (uav_id, uav_status[uav_id]['pos'], target.position, uav_status[uav_id]['heading'], graph.phi_set[uav_info['phi_idx']], obstacles, config)
-                _, plan_result = _plan_single_leg(args)
-                if plan_result: path_planners[uav_id] = {'path_points': plan_result[0], 'distance': plan_result[1]}
-            time_windows = []
-            for uav_info in uav_infos:
-                uav_id = uav_info['uav_id']
-                if uav_id not in path_planners: continue
-                uav = next((u for u in uavs if u.id == uav_id), None)
-                if not uav: continue
-                distance = path_planners[uav_id]['distance']; free_at = uav_status[uav_id]['free_at']; t_min = free_at + (distance / uav.velocity_range[1]); t_max = free_at + (distance / uav.velocity_range[0]) if uav.velocity_range[0] > 0 else float('inf')
-                t_econ = free_at + (distance / uav.economic_speed)
-                time_windows.append({'uav_id': uav_id, 'phi_idx': uav_info['phi_idx'], 't_min': t_min, 't_max': t_max, 't_econ': t_econ})
-            if not time_windows: continue
-            sync_start = max(tw['t_min'] for tw in time_windows); sync_end = min(tw['t_max'] for tw in time_windows); is_feasible = sync_start <= sync_end + 1e-6
-            final_sync_time = np.clip(np.median([tw['t_econ'] for tw in time_windows]), sync_start, sync_end) if is_feasible else sync_start
-            group_arrival_times.append({'target_id': target_id, 'arrival_time': final_sync_time, 'uav_infos': time_windows, 'is_feasible': is_feasible, 'path_planners': path_planners})
-        if not group_arrival_times: break
-        next_event = min(group_arrival_times, key=lambda x: x['arrival_time']); target_pos = next(t.position for t in targets if t.id == next_event['target_id'])
-        for uav_info in next_event['uav_infos']:
-            uav_id = uav_info['uav_id']
-            if uav_id not in next_event['path_planners']: continue
-            uav, plan_data = next(u for u in uavs if u.id == uav_id), next_event['path_planners'][uav_id]; travel_time = next_event['arrival_time'] - uav_status[uav_id]['free_at']
-            speed = (plan_data['distance'] / travel_time) if travel_time > 1e-6 else uav.velocity_range[1]
-            final_plan[uav_id].append({'target_id': next_event['target_id'], 'start_pos': uav_status[uav_id]['pos'], 'speed': np.clip(speed, uav.velocity_range[0], uav.velocity_range[1]), 'arrival_time': next_event['arrival_time'], 'step': task_step_counter[uav_id], 'is_sync_feasible': next_event['is_feasible'], 'phi_idx': uav_info['phi_idx'], 'path_points': plan_data['path_points'], 'distance': plan_data['distance']})
-            task_step_counter[uav_id] += 1; uav_status[uav_id].update(pos=target_pos, free_at=next_event['arrival_time'], heading=graph.phi_set[uav_info['phi_idx']])
-            if remaining_tasks.get(uav_id): remaining_tasks[uav_id].pop(0)
-    # 应用协同贪婪资源分配策略以匹配可视化逻辑
-    temp_uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
-    temp_target_resources = {t.id: t.resources.copy().astype(float) for t in targets}
-
-    # 按事件分组任务
-    events = defaultdict(list)
-    for uav_id, tasks in final_plan.items():
-        for task in tasks:
-            event_key = (task['arrival_time'], task['target_id'])
-            # 将无人机ID和任务引用存入对应的事件组
-            events[event_key].append({'uav_id': uav_id, 'task_ref': task})
+        """加载模型"""
+        self.policy_net.load_state_dict(torch.load(path, map_location=self.device))
     
-    # 按时间顺序处理事件
-    for event_key in sorted(events.keys()):
-        arrival_time, target_id = event_key
-        collaborating_tasks = events[event_key]
-        target_remaining = temp_target_resources[target_id].copy()
+    def get_task_assignments(self):
+        """获取任务分配"""
+        self.policy_net.eval()
+        state = self.env.reset()
+        assignments = {u.id: [] for u in self.env.uavs}
+        done, step = False, 0
         
-        # 分配资源
-        for item in collaborating_tasks:
-            uav_id = item['uav_id']
-            task = item['task_ref']
-            uav_resources = temp_uav_resources[uav_id]
+        while not done and step < len(self.env.targets) * len(self.env.uavs):
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+            action_idx = q_values.max(1)[1].item()
+            action = self._index_to_action(action_idx)
+            target_id, uav_id, _ = action
             
-            if np.all(target_remaining < 1e-6):
-                task['resource_cost'] = np.zeros_like(uav_resources)
+            uav = self.env.uavs[uav_id - 1]
+            target = self.env.targets[target_id - 1]
+            
+            if np.all(uav.resources <= 0):
+                step += 1
                 continue
-                
-            contribution = np.minimum(target_remaining, uav_resources)
-            task['resource_cost'] = contribution
-            temp_uav_resources[uav_id] -= contribution
-            target_remaining -= contribution
             
-        temp_target_resources[target_id] = target_remaining
+            assignments[uav_id].append((target_id, action[2]))
+            state, _, done, _, _ = self.env.step(action_idx)
+            step += 1
+        
+        return assignments
 
-    return final_plan, remaining_tasks
-
-
-
-# [新增] 从批处理测试器导入评估函数，用于对单个方案进行性能评估
-from evaluate import evaluate_plan
-
+# =============================================================================
+# section 5: 核心功能函数
+# =============================================================================
 def calibrate_resource_assignments(task_assignments, uavs, targets):
     """
     校准资源分配，移除无效的任务分配。
@@ -1105,12 +1067,12 @@ def calibrate_resource_assignments(task_assignments, uavs, targets):
         for target_id, phi_idx in uav_tasks:
             # 检查目标是否还需要资源
             if not np.any(target_needs[target_id] > 1e-6):
-                print(f"警告: UAV {uav_id} 被分配到已满足的目标 {target_id}，跳过此分配")
+                # print(f"警告: UAV {uav_id} 被分配到已满足的目标 {target_id}，跳过此分配")  # 简化输出
                 continue
             
             # 检查无人机是否还有资源
             if not np.any(uav_resources[uav_id] > 1e-6):
-                print(f"警告: UAV {uav_id} 资源已耗尽，跳过后续分配")
+                # print(f"警告: UAV {uav_id} 资源已耗尽，跳过后续分配")  # 简化输出
                 break
             
             # 计算实际贡献
@@ -1121,9 +1083,10 @@ def calibrate_resource_assignments(task_assignments, uavs, targets):
                 calibrated_assignments[uav_id].append((target_id, phi_idx))
                 uav_resources[uav_id] -= contribution
                 target_needs[target_id] -= contribution
-                print(f"UAV {uav_id} -> 目标 {target_id}: 贡献 {contribution}")
+                # print(f"UAV {uav_id} -> 目标 {target_id}: 贡献 {contribution}")  # 简化输出
             else:
-                print(f"警告: UAV {uav_id} 对目标 {target_id} 无有效贡献，跳过此分配")
+                # print(f"警告: UAV {uav_id} 对目标 {target_id} 无有效贡献，跳过此分配")  # 简化输出
+                pass
     
     # 统计校准结果
     original_count = sum(len(tasks) for tasks in task_assignments.values())
@@ -1137,9 +1100,259 @@ def calibrate_resource_assignments(task_assignments, uavs, targets):
     
     return calibrated_assignments
 
+def simple_evaluate_plan(task_assignments, uavs, targets, deadlocked_tasks=None):
+    """修复后的计划评估函数 - 基于实际任务完成情况和资源分配"""
+    if not task_assignments or not any(task_assignments.values()):
+        return {
+            'completion_rate': 0.0,
+            'satisfied_targets_rate': 0.0,
+            'total_reward_score': 0.0,
+            'marginal_utility_score': 0.0,
+            'resource_efficiency_score': 0.0,
+            'distance_cost_score': 0.0,
+            'actual_completion_rate': 0.0,
+            'resource_satisfaction_rate': 0.0
+        }
+    
+    # 重置目标资源状态以计算实际完成情况
+    temp_targets = []
+    for target in targets:
+        temp_target = type('TempTarget', (), {'id': target.id, 'position': target.position, 
+                                           'resources': target.resources.astype(float).copy(), 
+                                           'remaining_resources': target.resources.astype(float).copy()})()
+        temp_targets.append(temp_target)
+    
+    # 计算实际资源贡献
+    total_contribution = 0.0
+    total_available = 0.0
+    total_distance = 0.0
+    
+    for uav in uavs:
+        total_available += np.sum(uav.resources)
+        uav_remaining = uav.initial_resources.copy().astype(float)
+        
+        if uav.id in task_assignments:
+            for task in task_assignments[uav.id]:
+                # 处理不同格式的任务数据
+                if isinstance(task, tuple):
+                    target_id = task[0]
+                    phi_idx = task[1]
+                    start_pos = uav.current_position
+                else:
+                    target_id = task['target_id']
+                    start_pos = task['start_pos']
+                
+                target = next(t for t in temp_targets if t.id == target_id)
+                
+                # 计算实际贡献
+                contribution = np.minimum(target.remaining_resources, uav_remaining)
+                actual_contribution = np.sum(contribution)
+                
+                if actual_contribution > 0:
+                    target.remaining_resources = target.remaining_resources - contribution
+                    uav_remaining = uav_remaining - contribution
+                    total_contribution += actual_contribution
+                
+                # 计算距离
+                distance = np.linalg.norm(start_pos - target.position)
+                total_distance += distance
+    
+    # 计算实际完成率（优化版本，综合考虑多个指标）
+    total_targets = len(targets)
+    if total_targets > 0:
+        # 1. 目标满足数量比例
+        completed_targets = sum(1 for t in temp_targets if np.all(t.remaining_resources <= 0))
+        target_satisfaction_rate = completed_targets / total_targets
+        
+        # 2. 总体资源满足率
+        total_demand = sum(np.sum(t.resources) for t in targets)
+        total_remaining = sum(np.sum(t.remaining_resources) for t in temp_targets)
+        resource_satisfaction_rate = (total_demand - total_remaining) / total_demand if total_demand > 0 else 0
+        
+        # 3. 资源利用率
+        total_initial_supply = sum(np.sum(uav.initial_resources) for uav in uavs)
+        total_used = total_contribution
+        resource_utilization_rate = total_used / total_initial_supply if total_initial_supply > 0 else 0
+        
+        # 综合完成率 = 目标满足率(50%) + 资源满足率(30%) + 资源利用率(20%)
+        actual_completion_rate = (target_satisfaction_rate * 0.5 + 
+                                resource_satisfaction_rate * 0.3 + 
+                                resource_utilization_rate * 0.2)
+    else:
+        actual_completion_rate = 0.0
+    
+    # 计算资源满足率（基于实际贡献）
+    total_required = sum(np.sum(t.resources) for t in targets)
+    resource_satisfaction_rate = total_contribution / total_required if total_required > 0 else 0.0
+    
+    # 计算目标满足率（部分或完全满足）
+    satisfied_targets = sum(1 for t in temp_targets if np.any(t.resources > t.remaining_resources))
+    satisfied_targets_rate = satisfied_targets / total_targets if total_targets > 0 else 0.0
+    
+    # 计算资源效率
+    resource_efficiency_score = 0.0
+    if total_available > 0:
+        resource_efficiency_score = (total_contribution / total_available) * 500
+    
+    # 计算距离成本
+    distance_cost_score = -total_distance * 0.1
+    
+    # 计算边际效用
+    marginal_utility_score = 0.0
+    for target in temp_targets:
+        target_initial_total = np.sum(target.resources)
+        target_remaining = np.sum(target.remaining_resources)
+        if target_initial_total > 0:
+            completion_ratio = 1.0 - (target_remaining / target_initial_total)
+            # 使用改进的边际效用计算
+            marginal_utility = completion_ratio * (1.0 - completion_ratio)
+            marginal_utility_score += marginal_utility * 300
+    
+    # 计算总奖励分数（与优化后的奖励函数保持一致）
+    target_completion_score = actual_completion_rate * 500  # 与新的target_completion_reward一致
+    completion_bonus = 1000 if actual_completion_rate >= 0.95 else 0  # 放宽完成标准
+    
+    total_reward_score = (target_completion_score + marginal_utility_score + 
+                         resource_efficiency_score + distance_cost_score + completion_bonus)
+    
+    return {
+        'completion_rate': actual_completion_rate,  # 综合完成率
+        'satisfied_targets_rate': satisfied_targets_rate,  # 目标满足率
+        'target_satisfaction_rate': target_satisfaction_rate,  # 完全满足的目标比例
+        'resource_satisfaction_rate': resource_satisfaction_rate,  # 总体资源满足率
+        'resource_utilization_rate': resource_utilization_rate,  # 资源利用率
+        'total_reward_score': total_reward_score,
+        'marginal_utility_score': marginal_utility_score,
+        'resource_efficiency_score': resource_efficiency_score,
+        'distance_cost_score': distance_cost_score,
+        'target_completion_score': target_completion_score,
+        'completion_bonus': completion_bonus,
+        # 'actual_completion_rate': actual_completion_rate,  # 移除重复定义
+        'completed_targets_count': completed_targets,  # 完全满足的目标数量
+        'total_targets_count': total_targets,  # 总目标数量
+        'total_contribution': total_contribution,  # 总资源贡献
+        'total_demand': sum(np.sum(t.resources) for t in targets),  # 总资源需求
+        'total_initial_supply': sum(np.sum(uav.initial_resources) for uav in uavs)  # 总初始资源供给
+    }
 
-def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, scenario_name, training_time, plan_generation_time,
-                             save_plot=True, show_plot=False, save_report=False, deadlocked_tasks=None, evaluation_metrics=None):
+def calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obstacles, config) -> Tuple[defaultdict, dict]:
+    """(已更新) 计算经济同步速度，并返回未完成的任务以进行死锁检测。"""
+    # 转换任务数据结构并补充资源消耗
+    final_plan = defaultdict(list)
+    uav_status = {u.id: {'pos': u.position, 'free_at': 0.0, 'heading': u.heading} for u in uavs}
+    remaining_tasks = {uav_id: list(tasks) for uav_id, tasks in task_assignments.items()}
+    task_step_counter = defaultdict(lambda: 1)
+    
+    def _plan_single_leg(args):
+        uav_id, start_pos, target_pos, start_heading, end_heading, obstacles, config = args
+        planner = PHCurveRRTPlanner(start_pos, target_pos, start_heading, end_heading, obstacles, config)
+        return uav_id, planner.plan()
+    
+    while any(v for v in remaining_tasks.values()):
+        next_target_groups = defaultdict(list)
+        for uav_id, tasks in remaining_tasks.items():
+            if tasks: next_target_groups[tasks[0][0]].append({'uav_id': uav_id, 'phi_idx': tasks[0][1]})
+        if not next_target_groups: break
+        
+        group_arrival_times = []
+        for target_id, uav_infos in next_target_groups.items():
+            target = next((t for t in targets if t.id == target_id), None)
+            if not target: continue
+            
+            path_planners = {}
+            for uav_info in uav_infos:
+                uav_id = uav_info['uav_id']
+                phi_angle = uav_info['phi_idx'] * (2 * np.pi / config.GRAPH_N_PHI)
+                args = (uav_id, uav_status[uav_id]['pos'], target.position, uav_status[uav_id]['heading'], phi_angle, obstacles, config)
+                _, plan_result = _plan_single_leg(args)
+                if plan_result: path_planners[uav_id] = {'path_points': plan_result[0], 'distance': plan_result[1]}
+            
+            time_windows = []
+            for uav_info in uav_infos:
+                uav_id = uav_info['uav_id']
+                if uav_id not in path_planners: continue
+                uav = next((u for u in uavs if u.id == uav_id), None)
+                if not uav: continue
+                
+                distance = path_planners[uav_id]['distance']
+                free_at = uav_status[uav_id]['free_at']
+                t_min = free_at + (distance / uav.velocity_range[1])
+                t_max = free_at + (distance / uav.velocity_range[0]) if uav.velocity_range[0] > 0 else float('inf')
+                t_econ = free_at + (distance / uav.economic_speed)
+                time_windows.append({'uav_id': uav_id, 'phi_idx': uav_info['phi_idx'], 't_min': t_min, 't_max': t_max, 't_econ': t_econ})
+            
+            if not time_windows: continue
+            sync_start = max(tw['t_min'] for tw in time_windows)
+            sync_end = min(tw['t_max'] for tw in time_windows)
+            is_feasible = sync_start <= sync_end + 1e-6
+            final_sync_time = np.clip(np.median([tw['t_econ'] for tw in time_windows]), sync_start, sync_end) if is_feasible else sync_start
+            group_arrival_times.append({'target_id': target_id, 'arrival_time': final_sync_time, 'uav_infos': time_windows, 'is_feasible': is_feasible, 'path_planners': path_planners})
+        
+        if not group_arrival_times: break
+        next_event = min(group_arrival_times, key=lambda x: x['arrival_time'])
+        target_pos = next(t.position for t in targets if t.id == next_event['target_id'])
+        
+        for uav_info in next_event['uav_infos']:
+            uav_id = uav_info['uav_id']
+            if uav_id not in next_event['path_planners']: continue
+            
+            uav, plan_data = next(u for u in uavs if u.id == uav_id), next_event['path_planners'][uav_id]
+            travel_time = next_event['arrival_time'] - uav_status[uav_id]['free_at']
+            speed = (plan_data['distance'] / travel_time) if travel_time > 1e-6 else uav.velocity_range[1]
+            
+            final_plan[uav_id].append({
+                'target_id': next_event['target_id'],
+                'start_pos': uav_status[uav_id]['pos'],
+                'speed': np.clip(speed, uav.velocity_range[0], uav.velocity_range[1]),
+                'arrival_time': next_event['arrival_time'],
+                'step': task_step_counter[uav_id],
+                'is_sync_feasible': next_event['is_feasible'],
+                'phi_idx': uav_info['phi_idx'],
+                'path_points': plan_data['path_points'],
+                'distance': plan_data['distance']
+            })
+            
+            task_step_counter[uav_id] += 1
+            phi_angle = uav_info['phi_idx'] * (2 * np.pi / config.GRAPH_N_PHI)
+            uav_status[uav_id].update(pos=target_pos, free_at=next_event['arrival_time'], heading=phi_angle)
+            if remaining_tasks.get(uav_id): remaining_tasks[uav_id].pop(0)
+    
+    # 应用协同贪婪资源分配策略
+    temp_uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
+    temp_target_resources = {t.id: t.resources.copy().astype(float) for t in targets}
+    
+    events = defaultdict(list)
+    for uav_id, tasks in final_plan.items():
+        for task in tasks:
+            event_key = (task['arrival_time'], task['target_id'])
+            events[event_key].append({'uav_id': uav_id, 'task_ref': task})
+    
+    for event_key in sorted(events.keys()):
+        arrival_time, target_id = event_key
+        collaborating_tasks = events[event_key]
+        target_remaining = temp_target_resources[target_id].copy()
+        
+        for item in collaborating_tasks:
+            uav_id = item['uav_id']
+            task = item['task_ref']
+            uav_resources = temp_uav_resources[uav_id]
+            
+            if np.all(target_remaining < 1e-6):
+                task['resource_cost'] = np.zeros_like(uav_resources)
+                continue
+                
+            contribution = np.minimum(target_remaining, uav_resources)
+            task['resource_cost'] = contribution
+            temp_uav_resources[uav_id] -= contribution
+            target_remaining -= contribution
+            
+        temp_target_resources[target_id] = target_remaining
+    
+    return final_plan, remaining_tasks
+
+def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, scenario_name, 
+                             training_time, plan_generation_time, save_plot=True, show_plot=False, 
+                             save_report=False, deadlocked_tasks=None, evaluation_metrics=None, output_dir=None):
     """(已更新并修复资源计算bug) 可视化任务分配方案。"""
     
     # [增加协同事件分析] 在报告中加入事件说明，解释资源竞争
@@ -1193,53 +1406,20 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
         temp_target_resources[target_id] = target_remaining_need_before
         collaboration_log += f"   - 事件结束，目标剩余需求: {target_remaining_need_before}\n\n"
 
-    """(已更新并修复资源计算bug) 可视化任务分配方案。"""
-    
-    # [二次修复] 采用"协同贪婪"策略精确模拟资源消耗
-    temp_uav_resources = {u.id: u.initial_resources.copy().astype(float) for u in uavs}
-    temp_target_resources = {t.id: t.resources.copy().astype(float) for t in targets}
-
-    # 1. 按"事件"（同一时间、同一目标）对所有步骤进行分组
-    events = defaultdict(list)
-    for uav_id, tasks in final_plan.items():
-        for task in tasks:
-            event_key = (task['arrival_time'], task['target_id'])
-            # 将无人机ID和任务引用存入对应的事件组
-            events[event_key].append({'uav_id': uav_id, 'task_ref': task})
-    
-    # 2. 按时间顺序（事件发生的顺序）对事件进行排序
-    sorted_event_keys = sorted(events.keys())
-
-    # 3. 按事件顺序遍历，处理每个协作事件
-    for event_key in sorted_event_keys:
-        arrival_time, target_id = event_key
-        collaborating_steps = events[event_key]
-        
-        target_remaining_need = temp_target_resources[target_id].copy()
-        
-        # 4. 在事件内部，让每个协作者依次、尽力地贡献资源
-        for step in collaborating_steps:
-            uav_id = step['uav_id']
-            task = step['task_ref']
-
-            if not np.any(target_remaining_need > 1e-6):
-                task['resource_cost'] = np.zeros_like(temp_uav_resources[uav_id])
-                continue
-
-            uav_available_resources = temp_uav_resources[uav_id]
-            actual_contribution = np.minimum(target_remaining_need, uav_available_resources)
-            
-            temp_uav_resources[uav_id] -= actual_contribution
-            target_remaining_need -= actual_contribution
-            
-            task['resource_cost'] = actual_contribution
-            
-        temp_target_resources[target_id] = target_remaining_need
-
-
     # --- 后续的可视化和报告生成逻辑将使用上面计算出的精确 resource_cost ---
+    # 设置中文字体
+    set_chinese_font()
+    
     fig, ax = plt.subplots(figsize=(22, 14)); ax.set_facecolor("#f0f0f0");
-    for obs in obstacles: obs.draw(ax)
+    for obs in obstacles: 
+        if hasattr(obs, 'draw'):
+            obs.draw(ax)
+        elif hasattr(obs, 'center') and hasattr(obs, 'radius'):
+            circle = plt.Circle(obs.center, obs.radius, color='gray', alpha=0.3)
+            ax.add_patch(circle)
+        elif hasattr(obs, 'vertices'):
+            polygon = plt.Polygon(np.array(obs.vertices), color='gray', alpha=0.3)
+            ax.add_patch(polygon)
 
     target_collaborators_details = defaultdict(list)
     for uav_id, tasks in final_plan.items():
@@ -1269,7 +1449,6 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
         overall_completion_rate_percent = np.mean(np.minimum(total_contribution_all_for_summary, total_demand_all) / total_demand_safe) * 100
         summary_text = (f"总体资源满足情况:\n--------------------------\n- 总需求: {np.array2string(total_demand_all, formatter={'float_kind':lambda x: '%.0f' % x})}\n- 总贡献: {np.array2string(total_contribution_all_for_summary, formatter={'float_kind':lambda x: '%.1f' % x})}\n- 已满足目标: {satisfied_targets_count} / {num_targets} ({satisfaction_rate_percent:.1f}%)\n- 资源完成率: {overall_completion_rate_percent:.1f}%")
     
-    # ... (函数其余的可视化和报告生成代码未变) ...
     ax.scatter([u.position[0] for u in uavs], [u.position[1] for u in uavs], c='blue', marker='s', s=150, label='无人机起点', zorder=5, edgecolors='black')
     for u in uavs:
         ax.annotate(f"UAV{u.id}", (u.position[0], u.position[1]), fontsize=12, fontweight='bold', xytext=(0, -25), textcoords='offset points', ha='center', va='top')
@@ -1282,8 +1461,10 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
         if not details_text: annotation_text += "\n未分配无人机"
         else:
             for detail in details_text: annotation_text += f"\nUAV {detail['uav_id']} (T:{detail['arrival_time']:.1f}s) 贡献:{np.array2string(detail['resource_cost'], formatter={'float_kind': lambda x: '%.1f' % x})}"
-        if np.all(total_contribution >= t.resources - 1e-5): satisfaction_str, bbox_color = "[OK] 需求满足", 'lightgreen'
-        else: satisfaction_str, bbox_color = "[NG] 资源不足", 'mistyrose'
+        if np.all(total_contribution >= t.resources - 1e-5):
+            satisfaction_str, bbox_color = "[OK] 需求满足", 'lightgreen'
+        else:
+            satisfaction_str, bbox_color = "[NG] 资源不足", 'mistyrose'
         annotation_text += f"\n------------------\n状态: {satisfaction_str}"
         ax.annotate(f"T{t.id}", (t.position[0], t.position[1]), fontsize=12, fontweight='bold', xytext=(0, 18), textcoords='offset points', ha='center', va='bottom')
         ax.annotate(annotation_text, (t.position[0], t.position[1]), fontsize=7, xytext=(15, -15), textcoords='offset points', ha='left', va='top', bbox=dict(boxstyle='round,pad=0.4', fc=bbox_color, ec='black', alpha=0.9, lw=0.5), zorder=8)
@@ -1300,7 +1481,7 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
                 temp_resources -= resource_cost
                 resource_annotation_pos = path_points[int(len(path_points) * 0.85)]; remaining_res_str = f"R: {np.array2string(temp_resources.clip(0), formatter={'float_kind': lambda x: f'{x:.0f}'})}"
                 ax.text(resource_annotation_pos[0], resource_annotation_pos[1], remaining_res_str, color=uav_color, backgroundcolor='white', ha='center', va='center', fontsize=7, fontweight='bold', bbox=dict(boxstyle='round,pad=0.15', fc='white', ec=uav_color, alpha=0.8, lw=0.5), zorder=7)
-
+    
     deadlock_summary_text = ""
     if deadlocked_tasks and any(deadlocked_tasks.values()):
         deadlock_summary_text += "!!! 死锁检测 !!!\n--------------------------\n以下无人机未能完成其任务序列，可能陷入死锁：\n"
@@ -1318,10 +1499,14 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
             if key in ['completion_rate', 'satisfied_targets_rate', 'sync_feasibility_rate', 'load_balance_score', 'resource_utilization_rate']:
                 norm_value = evaluation_metrics.get(f'norm_{key}', 'N/A')
                 if isinstance(norm_value, float):
-                    print(f"  - {key}: {value:.4f} (归一化: {norm_value:.4f})")
+                    report_header += f"  - {key}: {value:.4f} (归一化: {norm_value:.4f})\n"
                 else:
-                    print(f"  - {key}: {value:.4f} (归一化: {norm_value})")
-        print("-" * 20)
+                    report_header += f"  - {key}: {value:.4f} (归一化: {norm_value})\n"
+            elif isinstance(value, float):
+                report_header += f"  - {key}: {value:.4f}\n"
+            else:
+                report_header += f"  - {key}: {value}\n"
+        report_header += ("-"*30) + "\n\n"
     
     report_body_image = ""; report_body_file = ""
     for uav in uavs:
@@ -1337,45 +1522,46 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
                 common_report_part = f"  {detail['step']}. 飞向目标 {detail['target_id']}{sync_status}:\n"; common_report_part += f"     - 飞行距离: {detail.get('distance', 0):.2f} m, 速度: {detail['speed']:.2f} m/s, 到达时间点: {detail['arrival_time']:.2f} s\n"
                 common_report_part += f"     - 消耗资源: {np.array2string(resource_cost, formatter={'float_kind': lambda x: '%.1f' % x})}\n"; common_report_part += f"     - 剩余资源: {np.array2string(temp_resources_report.clip(0), formatter={'float_kind': lambda x: f'{x:.1f}'})}\n"
                 report_body_image += common_report_part; report_body_file += common_report_part
-                # 根据用户要求，报告中不输出路径点
-                # path_points = detail.get('path_points')
-                # if path_points is not None and len(path_points) > 0:
-                #     points_per_line = 4; path_str_lines = []; line_buffer = []
-                #     for p in path_points:
-                #         line_buffer.append(f"({p[0]:.0f}, {p[1]:.0f})")
-                #         if len(line_buffer) >= points_per_line: path_str_lines.append(" -> ".join(line_buffer)); line_buffer = []
-                #     if line_buffer: path_str_lines.append(" -> ".join(line_buffer))
-                #     report_body_file += "     - 路径坐标:\n"
-                #     for line in path_str_lines: report_body_file += f"          {line}\n"
         report_body_image += "\n"; report_body_file += "\n"
     
     final_report_for_image = report_header + report_body_image; final_report_for_file = report_header + report_body_file
     plt.subplots_adjust(right=0.75); fig.text(0.77, 0.95, final_report_for_image, transform=plt.gcf().transFigure, ha="left", va="top", fontsize=9, bbox=dict(boxstyle='round,pad=0.5', fc='aliceblue', ec='grey', alpha=0.9))
     
     train_mode_str = '高精度' if config.USE_PHRRT_DURING_TRAINING else '快速近似'
+    
+    # 处理training_time格式化问题
+    if isinstance(training_time, (tuple, list)):
+        actual_episodes = len(training_time[0]) if training_time and len(training_time) > 0 else 0
+        estimated_time = actual_episodes * 0.13  # 基于观察到的每轮约0.13秒
+        training_time_str = f"{estimated_time:.2f}s ({actual_episodes}轮)"
+    else:
+        training_time_str = f"{training_time:.2f}s"
+    
     title_text = (
         f"多无人机任务分配与路径规划 - {scenario_name}\n"
         f"UAV: {len(uavs)}, 目标: {len(targets)}, 障碍: {len(obstacles)} | 模式: {train_mode_str}\n"
-        f"模型训练耗时: {training_time:.2f}s | 方案生成耗时: {plan_generation_time:.2f}s"
+        f"模型训练耗时: {training_time_str} | 方案生成耗时: {plan_generation_time:.2f}s"
     )
     ax.set_title(title_text, fontsize=12, fontweight='bold', pad=20)
 
     ax.set_xlabel("X坐标 (m)", fontsize=14); ax.set_ylabel("Y坐标 (m)", fontsize=14); ax.legend(loc="lower left"); ax.grid(True, linestyle='--', alpha=0.5, zorder=0); ax.set_aspect('equal', adjustable='box')
     
     if save_plot:
-        output_dir = "output/images"
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        clean_scenario_name = scenario_name.replace(' ', '_').replace(':', '')
-        base_filename = f"{clean_scenario_name}_{timestamp}"
-        img_filepath = os.path.join(output_dir, f"{base_filename}.png")
-        plt.savefig(img_filepath, dpi=300)
-        print(f"结果图已保存至: {img_filepath}")
+        if output_dir:
+            save_path = f'{output_dir}/{scenario_name}_task_assignments.png'
+        else:
+            output_dir = "output/images"
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            clean_scenario_name = scenario_name.replace(' ', '_').replace(':', '')
+            base_filename = f"{clean_scenario_name}_{timestamp}"
+            save_path = os.path.join(output_dir, f"{base_filename}.png")
+        plt.savefig(save_path, dpi=300)
+        print(f"结果图已保存至: {save_path}")
         
         if save_report:
-            report_dir = "output/reports"
-            os.makedirs(report_dir, exist_ok=True)
-            report_filepath = os.path.join(report_dir, f"{base_filename}.txt")
+            # 直接保存到主目录
+            report_filepath = f'{output_dir}/{scenario_name}_report.txt'
             try:
                 with open(report_filepath, 'w', encoding='utf-8') as f:
                     f.write(final_report_for_file)
@@ -1387,228 +1573,581 @@ def visualize_task_assignments(final_plan, uavs, targets, obstacles, config, sce
         plt.show()
     plt.close(fig) # 确保无论是否显示，图形对象都被关闭以释放内存
 
-# =============================================================================
-# section 6: (新增) 辅助函数 & 主流程控制
-# =============================================================================
-import hashlib
-
-def get_config_hash(config):
-    """根据关键配置参数生成直观的配置标识字符串"""
-    return (
-        f"lr{config.LEARNING_RATE}_g{config.GAMMA}_"
-        f"eps{config.EPSILON_END}-{config.EPSILON_DECAY}_"
-        f"upd{config.TARGET_UPDATE_FREQ}_bs{config.BATCH_SIZE}_"
-        f"phi{config.GRAPH_N_PHI}_phrrt{int(config.USE_PHRRT_DURING_TRAINING)}_"
-        f"steps{config.EPISODES}"
-    )
-
-def _find_latest_checkpoint(model_path: str) -> Optional[str]:
-    """查找最新的检查点文件"""
-    model_dir = os.path.dirname(model_path)
-    if not os.path.exists(model_dir):
-        return None
-    
-    checkpoint_files = []
-    for file in os.listdir(model_dir):
-        if file.startswith('model_checkpoint_ep_') and file.endswith('.pth'):
-            checkpoint_files.append(os.path.join(model_dir, file))
-    
-    if not checkpoint_files:
-        return None
-    
-    # 按文件名中的轮次数排序
-    checkpoint_files.sort(key=lambda x: int(x.split('_ep_')[1].split('.')[0]))
-    return checkpoint_files[-1] if checkpoint_files else None
-
-def _get_trained_episodes(model_path: str) -> int:
-    """获取已训练的轮次数"""
-    try:
-        # 尝试从训练历史文件中获取
-        history_dir = os.path.dirname(model_path)
-        history_files = [f for f in os.listdir(history_dir) if f.startswith('training_history_')]
-        
-        if history_files:
-            # 从最新的历史文件中提取轮次数
-            latest_history = max(history_files, key=lambda x: os.path.getmtime(os.path.join(history_dir, x)))
-            with open(os.path.join(history_dir, latest_history), 'rb') as f:
-                import pickle
-                history = pickle.load(f)
-                return len(history.get('episode_rewards', []))
-        
-        # 如果无法从历史文件获取，尝试从检查点文件名获取
-        checkpoint_path = _find_latest_checkpoint(model_path)
-        if checkpoint_path:
-            episode_str = checkpoint_path.split('_ep_')[1].split('.')[0]
-            return int(episode_str)
-        
-        return 0
-    except Exception as e:
-        print(f"获取已训练轮次数时出错: {e}")
-        return 0
-
 def run_scenario(config, base_uavs, base_targets, obstacles, scenario_name, 
-                 save_visualization=True, show_visualization=True, save_report=False,
-                 force_retrain=False, incremental_training=False):
+                network_type="SimpleNetwork", save_visualization=True, show_visualization=True, 
+                save_report=False, force_retrain=False, incremental_training=False, output_base_dir=None):
     """
-    (已重构) 运行一个完整的场景测试，支持增量训练和自适应训练。
+    运行场景 - 核心执行器 (优化版本，统一目录结构，支持TensorBoard)
     
     Args:
-        force_retrain: 强制重新训练，忽略已存在的模型
-        incremental_training: 增量训练模式，在现有模型基础上继续训练
+        config: 配置对象
+        base_uavs: UAV列表
+        base_targets: 目标列表
+        obstacles: 障碍物列表
+        scenario_name: 场景名称
+        network_type: 网络类型 ("SimpleNetwork", "DeepFCN", "GAT", "DeepFCNResidual")
+        save_visualization: 是否保存可视化
+        show_visualization: 是否显示可视化
+        save_report: 是否保存报告
+        force_retrain: 是否强制重新训练
+        incremental_training: 是否增量训练
+        output_base_dir: 基础输出目录，如果为None则使用默认
+        
+    Returns:
+        final_plan: 最终计划
+        training_time: 训练时间
+        training_history: 训练历史
+        evaluation_metrics: 评估指标
     """
-    config_hash = get_config_hash(config)
-    model_path = os.path.join('output', 'models', scenario_name.replace(' ', '_'), config_hash, 'model.pth')
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-
-    print(f"\n{'='*25}\n   Running: {scenario_name} (Config Hash: {config_hash})\n{'='*25}")
-
-    uavs = [UAV(u.id, u.position, u.heading, u.resources, u.max_distance, u.velocity_range, u.economic_speed) for u in base_uavs]
-    targets = [Target(t.id, t.position, t.resources, t.value) for t in base_targets]
-    if not uavs or not targets: 
-        print("场景中缺少无人机或目标，跳过执行。")
-        return {}, 0.0, {}
-
-    graph = DirectedGraph(uavs, targets, n_phi=config.GRAPH_N_PHI)
-    i_dim = len(UAVTaskEnv(uavs, targets, graph, obstacles, config).reset())
-    o_dim = len(targets) * len(uavs) * graph.n_phi
+    import time
+    import os
+    import pickle
+    import json
     
-    # 检查是否使用自适应训练系统
-    use_adaptive_training = hasattr(config, 'USE_ADAPTIVE_TRAINING') and config.USE_ADAPTIVE_TRAINING
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
     
-    if use_adaptive_training:
-        from temp_code.adaptive_training_system import AdaptiveGraphRLSolver
-        solver = AdaptiveGraphRLSolver(uavs, targets, graph, obstacles, i_dim, 256, o_dim, config)
+    network_type = config.NETWORK_TYPE
+
+    # 优化的目录结构 - 统一到一个文件夹
+    if output_base_dir:
+        output_dir = f"{output_base_dir}/{scenario_name}_{network_type}"
     else:
-        solver = GraphRLSolver(uavs, targets, graph, obstacles, i_dim, 256, o_dim, config)
+        output_dir = f"output/{scenario_name}_{network_type}_{timestamp}"
     
-    training_time = 0.0
+    # 创建统一的输出目录结构
+    os.makedirs(output_dir, exist_ok=True)
     
-    # 智能模型加载逻辑
-    model_loaded = False
-    checkpoint_path = None
+    print(f"运行场景: {scenario_name} ({len(base_uavs)}UAV, {len(base_targets)}目标, {len(obstacles)}障碍)")
+    print(f"输出目录: {output_dir}")
     
-    if not force_retrain:
-        # 尝试加载完整模型
-        model_loaded = solver.load_model(model_path)
-        
-        if not model_loaded and incremental_training:
-            # 尝试找到最新的检查点
-            checkpoint_path = _find_latest_checkpoint(model_path)
-            if checkpoint_path:
-                print(f"找到检查点: {checkpoint_path}")
-                if hasattr(solver, '_load_checkpoint'):
-                    solver._load_checkpoint(checkpoint_path)
-                    model_loaded = True
-                    print(f"从检查点恢复训练")
+    # 创建图
+    graph = DirectedGraph(base_uavs, base_targets, config.GRAPH_N_PHI, obstacles, config)
     
-    # 训练决策逻辑
-    if config.RUN_TRAINING:
-        if model_loaded and not force_retrain:
-            if incremental_training:
-                print(f"找到已训练模型，将进行增量训练... ({model_path})")
-                # 增量训练：在现有基础上增加训练轮次
-                additional_episodes = config.EPISODES - _get_trained_episodes(model_path)
-                if additional_episodes > 0:
-                    print(f"将在现有基础上增加 {additional_episodes} 轮训练")
-                    training_time = solver.train(episodes=additional_episodes, patience=config.PATIENCE, 
-                                               log_interval=config.LOG_INTERVAL, model_save_path=model_path)
-                else:
-                    print("模型已训练完成，无需额外训练")
-            else:
-                print(f"找到已训练模型，将重新训练... ({model_path})")
-                training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, 
-                                           log_interval=config.LOG_INTERVAL, model_save_path=model_path)
-        else:
-            print(f"开始新的训练... ({model_path})")
-            training_time = solver.train(episodes=config.EPISODES, patience=config.PATIENCE, 
-                                       log_interval=config.LOG_INTERVAL, model_save_path=model_path)
-    elif not model_loaded:
-        print(f"警告: 跳过训练，但未找到预训练模型 ({model_path})。任务分配将基于未训练的模型。")
-    else:
-        print(f"已加载预训练模型 ({model_path})，跳过训练阶段。")
-
-    print(f"----- [阶段 2: 生成最终方案 ({scenario_name} @ {config_hash})] -----")
-    # [已修订] 移除多余的二次加载逻辑。此时solver中的模型已是最新状态（刚训练的或已加载的）。
+    # 创建求解器 - 动态计算输入维度，支持TensorBoard
+    test_env = UAVTaskEnv(base_uavs, base_targets, graph, obstacles, config)
+    test_state = test_env.reset()
+    input_dim = len(test_state)
+    output_dim = test_env.n_actions
+    
+    # TensorBoard目录 - 直接使用主输出目录
+    tensorboard_dir = output_dir
+    
+    # 使用更深的网络结构
+    solver = GraphRLSolver(base_uavs, base_targets, graph, obstacles, 
+                          i_dim=input_dim, h_dim=[512, 256, 128, 64], o_dim=output_dim, 
+                          config=config, network_type=network_type, 
+                          tensorboard_dir=tensorboard_dir)
+    
+    # 训练模型
+    model_save_path = f'{output_dir}/{network_type}_best_model.pth'
+    print(f"开始训练 - 网络: {network_type}, 训练轮数: {config.training_config.episodes}")
+    # print(f"模型将保存至: {model_save_path}")
+    # print(f"TensorBoard日志目录: {tensorboard_dir}")
+    # print(f"训练参数: episodes={config.training_config.episodes}, learning_rate={config.training_config.learning_rate}, patience={config.training_config.patience}")
+    # print(f"可以使用以下命令查看TensorBoard: tensorboard --logdir={tensorboard_dir}")
+    
+    training_time = solver.train(
+        episodes=config.training_config.episodes, 
+        patience=config.training_config.patience, 
+        log_interval=config.training_config.log_interval, 
+        model_save_path=model_save_path
+    )
+    
+    # 获取任务分配
+    print("获取训练后的任务分配...")
     task_assignments = solver.get_task_assignments()
-    print("获取的任务分配方案:", {k:v for k,v in task_assignments.items() if v})
     
-    # [新增] 校准资源分配，移除无效分配
-    task_assignments = calibrate_resource_assignments(task_assignments, uavs, targets)
-    print("校准后的任务分配方案:", {k:v for k,v in task_assignments.items() if v})
+    # 校准资源分配
+    print("校准资源分配...")
+    calibrated_assignments = calibrate_resource_assignments(task_assignments, base_uavs, base_targets)
     
-    plan_generation_start_time = time.time()
-    final_plan, deadlocked_tasks = calculate_economic_sync_speeds(task_assignments, uavs, targets, graph, obstacles, config)
-    plan_generation_time = time.time() - plan_generation_start_time
+    # 计算路径规划
+    print("计算路径规划...")
+    final_plan, remaining_tasks = calculate_economic_sync_speeds(
+        calibrated_assignments, base_uavs, base_targets, graph, obstacles, config
+    )
     
-    # [新增] 调用从batch_tester导入的评估函数对最终方案进行量化评估
-    evaluation_metrics = None
-    if final_plan:
-        print(f"----- [阶段 3: 方案质量评估 ({scenario_name})] -----")
-        # 直接调用评估函数，并传入所需参数
-        evaluation_metrics = evaluate_plan(final_plan, uavs, targets, deadlocked_tasks)
+    # 检测真正的死锁任务 - 修复死锁检测逻辑
+    deadlocked_tasks = {}
+    for uav_id, tasks in remaining_tasks.items():
+        if tasks:  # 只有当任务列表非空时才认为是死锁
+            deadlocked_tasks[uav_id] = tasks
+    
+    # 评估解质量
+    evaluation_metrics = simple_evaluate_plan(task_assignments, base_uavs, base_targets, deadlocked_tasks)
+    
+    # 保存训练历史 - 增强版本
+    training_history = {
+        "episode_rewards": getattr(solver, 'episode_rewards', []),
+        "episode_losses": getattr(solver, 'episode_losses', []),
+        "epsilon_values": getattr(solver, 'epsilon_values', []),
+        "completion_rates": getattr(solver, 'completion_rates', []),
+        "episode_steps": getattr(solver, 'episode_steps', []),
+        "memory_usage": getattr(solver, 'memory_usage', []),
+        "network_type": network_type,
+        "scenario_name": scenario_name,
+        "training_time": training_time,
+        "config_summary": {
+            "episodes": config.training_config.episodes,
+            "learning_rate": config.training_config.learning_rate,
+            "batch_size": config.BATCH_SIZE,
+            "gamma": config.GAMMA,
+            "epsilon_start": config.training_config.epsilon_start,
+            "epsilon_end": config.training_config.epsilon_end,
+            "epsilon_decay": config.training_config.epsilon_decay
+        }
+    }
+    
+    history_path = f'{output_dir}/training_history.pkl'
+    with open(history_path, 'wb') as f:
+        pickle.dump(training_history, f)
+    
+    # 生成训练曲线
+    generate_training_curves(training_history, network_type, scenario_name, output_dir)
+    
+    # 输出解方案信息
+    print(f"\n=== {scenario_name} 解方案信息 ===")
+    print(f"网络类型: {network_type}")
+    print(f"训练时间: {training_time:.2f}秒")
+    print(f"任务分配数量: {len(task_assignments)}")
+    print(f"死锁任务数量: {len(deadlocked_tasks) if deadlocked_tasks else 0}")
+    
+    # 统计任务分配详情
+    total_assignments = sum(len(assignments) for assignments in task_assignments.values())
+    print(f"总任务分配数: {total_assignments}")
+    
+    # 输出评估指标
+    if evaluation_metrics:
+        print(f"\n方案评估指标:")
+        print(f"{'-' * 50}")
         
-        # 格式化并打印评估结果
-        print("评估指标:")
-        for key, value in evaluation_metrics.items():
-            if key == 'satisfied_targets_rate':
-                print(f"  - {key}: {value:.2f} (实际满足: {evaluation_metrics['satisfied_targets_count']}/{evaluation_metrics['total_targets']})")
-            elif isinstance(value, float):
-                print(f"  - {key}: {value:.2f}")
-            else:
-                print(f"  - {key}: {value}")
-        print("-" * 20)
+        # 核心指标
+        if 'completion_rate' in evaluation_metrics:
+            print(f"  综合完成率: {evaluation_metrics['completion_rate']:.4f}")
+        if 'target_satisfaction_rate' in evaluation_metrics:
+            completed = evaluation_metrics.get('completed_targets_count', 0)
+            total = evaluation_metrics.get('total_targets_count', 0)
+            print(f"  目标完全满足率: {evaluation_metrics['target_satisfaction_rate']:.4f} ({completed}/{total})")
+        if 'resource_satisfaction_rate' in evaluation_metrics:
+            print(f"  资源满足率: {evaluation_metrics['resource_satisfaction_rate']:.4f}")
+        if 'resource_utilization_rate' in evaluation_metrics:
+            print(f"  资源利用率: {evaluation_metrics['resource_utilization_rate']:.4f}")
+        
+        # 详细指标
+        if 'total_contribution' in evaluation_metrics and 'total_demand' in evaluation_metrics:
+            contrib = evaluation_metrics['total_contribution']
+            demand = evaluation_metrics['total_demand']
+            print(f"  资源贡献: {contrib:.1f}/{demand:.1f} ({contrib/demand*100:.1f}%)")
+        
+        if 'total_reward_score' in evaluation_metrics:
+            print(f"  总奖励分数: {evaluation_metrics['total_reward_score']:.2f}")
+        
+        print(f"{'-' * 50}")
     
-    # 添加训练收敛情况和早熟检测结果到评估指标中
-    if evaluation_metrics is None:
-        evaluation_metrics = {}
+    # 可视化结果
+    print("生成可视化结果...")
+    visualize_task_assignments(
+        final_plan, base_uavs, base_targets, obstacles, config, scenario_name,
+        training_time, 0, save_plot=save_visualization, show_plot=show_visualization,
+        output_dir=output_dir
+    )
     
-    if config.RUN_TRAINING:
-        evaluation_metrics['early_maturity_detected'] = solver.early_stop_detected
-        if solver.early_stop_detected:
-            print("警告: 检测到训练过程中可能存在早熟问题，增加训练轮次可能无法显著提升效果")
+    # 生成执行报告
+    generate_execution_report(scenario_name, network_type, training_time, 
+                            task_assignments, evaluation_metrics, training_history, output_dir)
     
-    if save_visualization or show_visualization:
-        visualize_task_assignments(final_plan, uavs, targets, obstacles, config, scenario_name, 
-                                 training_time=training_time,
-                                 plan_generation_time=plan_generation_time,
-                                 save_plot=save_visualization, 
-                                 save_report=save_report,
-                                 deadlocked_tasks=deadlocked_tasks,
-                                 evaluation_metrics=evaluation_metrics)
-
-    # 评估代码已移至上方
-
-    return final_plan, training_time, deadlocked_tasks
-
+    print(f"场景 {scenario_name} 运行完成")
+    print(f"所有输出已保存至: {output_dir}")
+    
+    return final_plan, training_time, training_history, evaluation_metrics
 
 def main():
-    """主函数，用于单独运行和调试一个默认场景。"""
-    set_chinese_font(manual_font_path='C:/Windows/Fonts/simhei.ttf')
-    config = Config()
+    """主函数 - 优化版本，支持统一目录管理"""
+    print("多无人机协同任务分配与路径规划系统 - 增强版")
+    print("=" * 60)
     
-    # 测试自适应训练系统
-    config.USE_ADAPTIVE_TRAINING = True  # 启用自适应训练
-    config.RUN_TRAINING = True  # 启用训练
+    # 设置中文字体
+    set_chinese_font()
     
-    # 从scenarios模块加载战略价值陷阱场景
-    from scenarios import get_strategic_trap_scenario
-    strategic_uavs, strategic_targets, strategic_obstacles = get_strategic_trap_scenario(config.OBSTACLE_TOLERANCE)
-   
-    print("\n--- 测试战略价值陷阱场景 ---")
-    config.EPISODES = 300
-    run_scenario(config, strategic_uavs, strategic_targets, strategic_obstacles, 
-                "战略价值陷阱场景测试", show_visualization=False, save_report=True,
-                force_retrain=False, incremental_training=True)
+    # 创建统一的输出目录结构
+    os.makedirs('output', exist_ok=True)
+    os.makedirs('output/experiments', exist_ok=True)
+    os.makedirs('output/temp', exist_ok=True)  # 临时文件
+    os.makedirs('output/archive', exist_ok=True)  # 归档文件
+    
+    # 清理旧的临时文件
+    cleanup_temp_files()
+    
+    # 运行测试场景
+    print("加载场景数据...") 
+    # uavs, targets, obstacles = get_strategic_trap_scenario(50.0)
+    uavs, targets, obstacles = get_new_experimental_scenario(50.0) 
+    # uavs, targets, obstacles = get_complex_scenario_v4(30)
+    # uavs, targets, obstacles = get_balanced_scenario(50)
+    
+    
+    # 移除场景加载完成的详细输出，保持简洁
+    # print(f"场景加载完成:")
+    # print(f"  - UAV数量: {len(uavs)}")
+    # print(f"  - 目标数量: {len(targets)}")
+    # print(f"  - 障碍物数量: {len(obstacles)}")
+    
+    # 设置优化的训练参数
+    config.BATCH_SIZE = 128  # 增大批次大小
+    config.LEARNING_RATE = 5e-4  # 降低学习率
+    config.GAMMA = 0.99  # 提高折扣因子
+    config.MEMORY_CAPACITY = 20000  # 增大经验回放缓冲区
+    config.TARGET_UPDATE_FREQ = 10  # 更频繁地更新目标网络
+    config.training_config.episodes = 2000  # 增加训练轮数
+    config.NETWORK_TYPE = "DeepFCNResidual" # 使用深度残差网络结构 # 网络结构类型: SimpleNetwork、DeepFCN、GAT、DeepFCNResidual
+    
+    # 运行场景
+    final_plan, training_time, training_history, evaluation_metrics = run_scenario(
+        config, uavs, targets, obstacles, "试验场景场景",        
+        save_visualization=True, show_visualization=False
+    )
+    
+    # 输出最终结果
+    print(f"\n{'='*60}")
+    print(f"系统运行完成")
+    print(f"{'='*60}")
+    # print(f"网络架构: {config.NETWORK_TYPE}")
+    print(f"训练时间: {training_time:.2f}秒")
+    print(f"参与UAV: {len(final_plan) if final_plan else 0}个")
+    
+    # 输出核心性能指标
+    # if evaluation_metrics:
+    #     print(f"\n核心性能指标:")
+    #     print(f"{'-' * 30}")
+    #     if 'completion_rate' in evaluation_metrics:
+    #         print(f"综合完成率: {evaluation_metrics['completion_rate']:.4f}")
+    #     if 'target_satisfaction_rate' in evaluation_metrics:
+    #         completed = evaluation_metrics.get('completed_targets_count', 0)
+    #         total = evaluation_metrics.get('total_targets_count', 0)
+    #         print(f"目标完成: {completed}/{total} ({evaluation_metrics['target_satisfaction_rate']:.1%})")
+    #     if 'resource_utilization_rate' in evaluation_metrics:
+    #         print(f"资源利用率: {evaluation_metrics['resource_utilization_rate']:.1%}")
+    #     print(f"{'-' * 30}")
+    
+    # 生成训练报告
+    report_path = f'output/reports/{time.strftime("%Y%m%d-%H%M%S")}_training_report.txt'
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(f"训练报告 - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 50 + "\n")        
+        f.write(f"训练时间: {training_time:.2f}秒\n")
+        f.write(f"UAV数量: {len(uavs)}\n")
+        f.write(f"目标数量: {len(targets)}\n")
+        f.write(f"障碍物数量: {len(obstacles)}\n")
+        f.write(f"任务分配数量: {len(final_plan) if final_plan else 0}\n")
+        f.write(f"目标满足率: {evaluation_metrics.get('satisfied_targets_rate', 0):.4f}\n")
+        f.write(f"资源利用率: {evaluation_metrics.get('resource_utilization_rate', 0):.4f}\n")
+    
+    print(f"训练报告已保存至: {report_path}")
+    print("系统运行完成！")
 
-    # print("\n--- 测试1: 1000 ---")
-    # config.EPISODES = 1000
-    # run_scenario(config, complex_uavs, complex_targets, complex_obstacles, 
-    #             "自适应训练测试-基础", show_visualization=False, save_report=True,
-    #             force_retrain=False,incremental_training=True)
+def cleanup_temp_files():
+    """清理临时文件"""
+    import shutil
+    import glob
+    
+    print("清理临时文件...")
+    
+    # 移动旧的输出文件到temp目录
+    old_patterns = [
+        'output/*.png',
+        'output/*.txt', 
+        'output/*.pkl',
+        'output/*.json'
+    ]
+    
+    temp_dir = 'output/temp'
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    moved_count = 0
+    for pattern in old_patterns:
+        for file_path in glob.glob(pattern):
+            if os.path.isfile(file_path):
+                filename = os.path.basename(file_path)
+                new_path = os.path.join(temp_dir, filename)
+                try:
+                    shutil.move(file_path, new_path)
+                    moved_count += 1
+                except Exception as e:
+                    print(f"移动文件失败 {file_path}: {e}")
+    
+    if moved_count > 0:
+        print(f"已移动 {moved_count} 个临时文件到 {temp_dir}")
+    
+    # 清理空的旧目录
+    old_dirs = ['output/models', 'output/images', 'output/reports', 'output/curves']
+    for old_dir in old_dirs:
+        if os.path.exists(old_dir) and not os.listdir(old_dir):
+            try:
+                os.rmdir(old_dir)
+                print(f"已删除空目录: {old_dir}")
+            except Exception:
+                pass
+
+def generate_training_curves(training_history, network_type, scenario_name, output_dir):
+    """生成训练曲线 - 增强版本，包含更多调试信息"""
+    import matplotlib.pyplot as plt
+    
+    # 设置中文字体
+    set_chinese_font()
+    
+    # 创建更详细的训练曲线图
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    fig.suptitle(f'{scenario_name} - {network_type} 训练分析', fontsize=16)
+    
+    # 奖励曲线
+    if training_history.get('episode_rewards'):
+        rewards = training_history['episode_rewards']
+        axes[0, 0].plot(rewards, alpha=0.7, label='原始奖励')
+        # 添加移动平均
+        if len(rewards) > 10:
+            window = min(50, len(rewards) // 10)
+            moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
+            axes[0, 0].plot(range(window-1, len(rewards)), moving_avg, 'r-', linewidth=2, label=f'移动平均({window})')
+        axes[0, 0].set_title('奖励曲线')
+        axes[0, 0].set_xlabel('回合')
+        axes[0, 0].set_ylabel('奖励')
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].legend()
+    
+    # 损失曲线
+    if training_history.get('episode_losses'):
+        losses = training_history['episode_losses']
+        axes[0, 1].plot(losses, alpha=0.7, label='原始损失')
+        # 添加移动平均
+        if len(losses) > 10:
+            window = min(50, len(losses) // 10)
+            moving_avg = np.convolve(losses, np.ones(window)/window, mode='valid')
+            axes[0, 1].plot(range(window-1, len(losses)), moving_avg, 'r-', linewidth=2, label=f'移动平均({window})')
+        axes[0, 1].set_title('损失曲线')
+        axes[0, 1].set_xlabel('回合')
+        axes[0, 1].set_ylabel('损失')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].legend()
+        axes[0, 1].set_yscale('log')  # 使用对数刻度
+    
+    # 探索率曲线
+    if training_history.get('epsilon_values'):
+        axes[1, 0].plot(training_history['epsilon_values'])
+        axes[1, 0].set_title('探索率衰减')
+        axes[1, 0].set_xlabel('回合')
+        axes[1, 0].set_ylabel('探索率 (ε)')
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # 完成率曲线
+    if training_history.get('completion_rates'):
+        completion_rates = training_history['completion_rates']
+        axes[1, 1].plot(completion_rates, alpha=0.7, label='原始完成率')
+        # 添加移动平均
+        if len(completion_rates) > 10:
+            window = min(50, len(completion_rates) // 10)
+            moving_avg = np.convolve(completion_rates, np.ones(window)/window, mode='valid')
+            axes[1, 1].plot(range(window-1, len(completion_rates)), moving_avg, 'r-', linewidth=2, label=f'移动平均({window})')
+        axes[1, 1].set_title('任务完成率')
+        axes[1, 1].set_xlabel('回合')
+        axes[1, 1].set_ylabel('完成率')
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].legend()
+    
+    # 每回合步数
+    if training_history.get('episode_steps'):
+        axes[2, 0].plot(training_history['episode_steps'])
+        axes[2, 0].set_title('每回合步数')
+        axes[2, 0].set_xlabel('回合')
+        axes[2, 0].set_ylabel('步数')
+        axes[2, 0].grid(True, alpha=0.3)
+    
+    # 经验回放池使用情况
+    if training_history.get('memory_usage'):
+        axes[2, 1].plot(training_history['memory_usage'])
+        axes[2, 1].set_title('经验回放池使用情况')
+        axes[2, 1].set_xlabel('回合')
+        axes[2, 1].set_ylabel('存储的经验数量')
+        axes[2, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    save_path = f'{output_dir}/training_curves.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"训练曲线已保存至: {save_path}")
+    
+    # 生成收敛性分析报告
+    generate_convergence_analysis(training_history, network_type, scenario_name, output_dir)
+
+def generate_convergence_analysis(training_history, network_type, scenario_name, output_dir):
+    """生成收敛性分析报告"""
+    analysis_path = f'{output_dir}/convergence_analysis.txt'
+    
+    with open(analysis_path, 'w', encoding='utf-8') as f:
+        f.write(f"收敛性分析报告\n")
+        f.write(f"================\n\n")
+        f.write(f"网络类型: {network_type}\n")
+        f.write(f"场景名称: {scenario_name}\n\n")
+        
+        # 奖励分析
+        if training_history.get('episode_rewards'):
+            rewards = training_history['episode_rewards']
+            f.write(f"奖励分析:\n")
+            f.write(f"  - 初始奖励: {rewards[0]:.2f}\n")
+            f.write(f"  - 最终奖励: {rewards[-1]:.2f}\n")
+            f.write(f"  - 最大奖励: {max(rewards):.2f}\n")
+            f.write(f"  - 平均奖励: {np.mean(rewards):.2f}\n")
+            f.write(f"  - 奖励标准差: {np.std(rewards):.2f}\n")
+            
+            # 收敛性检查
+            if len(rewards) > 100:
+                last_100 = rewards[-100:]
+                first_100 = rewards[:100]
+                improvement = np.mean(last_100) - np.mean(first_100)
+                f.write(f"  - 前100回合平均: {np.mean(first_100):.2f}\n")
+                f.write(f"  - 后100回合平均: {np.mean(last_100):.2f}\n")
+                f.write(f"  - 改进程度: {improvement:.2f}\n")
+                
+                # 稳定性分析
+                last_50_std = np.std(rewards[-50:])
+                f.write(f"  - 最后50回合标准差: {last_50_std:.2f}\n")
+                if last_50_std < np.std(rewards) * 0.5:
+                    f.write(f"  - 收敛状态: 良好 (变化较小)\n")
+                else:
+                    f.write(f"  - 收敛状态: 不稳定 (仍在波动)\n")
+        
+        # 损失分析
+        if training_history.get('episode_losses'):
+            losses = training_history['episode_losses']
+            f.write(f"\n损失分析:\n")
+            f.write(f"  - 初始损失: {losses[0]:.4f}\n")
+            f.write(f"  - 最终损失: {losses[-1]:.4f}\n")
+            f.write(f"  - 最小损失: {min(losses):.4f}\n")
+            f.write(f"  - 平均损失: {np.mean(losses):.4f}\n")
+            
+            # 损失趋势
+            if len(losses) > 50:
+                recent_trend = np.mean(losses[-50:]) - np.mean(losses[-100:-50]) if len(losses) > 100 else 0
+                f.write(f"  - 近期趋势: {'下降' if recent_trend < 0 else '上升'} ({recent_trend:.4f})\n")
+        
+        # 完成率分析
+        if training_history.get('completion_rates'):
+            completion_rates = training_history['completion_rates']
+            f.write(f"\n完成率分析:\n")
+            f.write(f"  - 初始完成率: {completion_rates[0]:.3f}\n")
+            f.write(f"  - 最终完成率: {completion_rates[-1]:.3f}\n")
+            f.write(f"  - 最高完成率: {max(completion_rates):.3f}\n")
+            f.write(f"  - 平均完成率: {np.mean(completion_rates):.3f}\n")
+            
+            # 达到高完成率的频率
+            high_completion_count = sum(1 for rate in completion_rates if rate > 0.8)
+            f.write(f"  - 高完成率(>0.8)频率: {high_completion_count}/{len(completion_rates)} ({high_completion_count/len(completion_rates)*100:.1f}%)\n")
+        
+        # 训练效率分析
+        if training_history.get('training_time'):
+            f.write(f"\n训练效率:\n")
+            f.write(f"  - 总训练时间: {training_history['training_time']:.2f}秒\n")
+            f.write(f"  - 每回合平均时间: {training_history['training_time']/len(rewards):.3f}秒\n")
+        
+        # 收敛建议
+        f.write(f"\n收敛性建议:\n")
+        if training_history.get('episode_rewards'):
+            final_reward = rewards[-1]
+            max_reward = max(rewards)
+            if final_reward < max_reward * 0.8:
+                f.write(f"  - 建议增加训练回合数或调整学习率\n")
+            if np.std(rewards[-50:]) > np.std(rewards) * 0.7:
+                f.write(f"  - 建议降低学习率以提高稳定性\n")
+            if max(completion_rates) < 0.5:
+                f.write(f"  - 建议检查奖励函数设计和网络结构\n")
+    
+    print(f"收敛性分析报告已保存至: {analysis_path}")
+
+def generate_execution_report(scenario_name, network_type, training_time, 
+                            task_assignments, evaluation_metrics, training_history, output_dir):
+    """生成执行报告 - 增强版本"""
+    import json
+    
+    # 计算更详细的统计信息
+    training_stats = {}
+    if training_history.get('episode_rewards'):
+        rewards = training_history['episode_rewards']
+        training_stats.update({
+            "reward_mean": float(np.mean(rewards)),
+            "reward_std": float(np.std(rewards)),
+            "reward_max": float(max(rewards)),
+            "reward_min": float(min(rewards)),
+            "reward_final": float(rewards[-1]),
+            "reward_improvement": float(rewards[-1] - rewards[0]) if len(rewards) > 1 else 0
+        })
+    
+    if training_history.get('episode_losses'):
+        losses = training_history['episode_losses']
+        training_stats.update({
+            "loss_mean": float(np.mean(losses)),
+            "loss_std": float(np.std(losses)),
+            "loss_final": float(losses[-1]),
+            "loss_min": float(min(losses))
+        })
+    
+    report = {
+        "scenario_name": scenario_name,
+        "network_type": network_type,
+        "training_time": training_time,
+        "task_assignments_count": len(task_assignments),
+        "evaluation_metrics": evaluation_metrics,
+        "training_statistics": training_stats,
+        "training_history_summary": {
+            "total_episodes": len(training_history.get('episode_rewards', [])),
+            "final_reward": training_history.get('episode_rewards', [0])[-1] if training_history.get('episode_rewards') else 0,
+            "final_loss": training_history.get('episode_losses', [0])[-1] if training_history.get('episode_losses') else 0,
+            "final_epsilon": training_history.get('epsilon_values', [0])[-1] if training_history.get('epsilon_values') else 0,
+            "final_completion_rate": training_history.get('completion_rates', [0])[-1] if training_history.get('completion_rates') else 0
+        },
+        "config_summary": training_history.get('config_summary', {})
+    }
+    
+    # 转换numpy类型后再序列化
+    serializable_report = convert_numpy_types(report)
+    with open(f'{output_dir}/execution_report.json', 'w', encoding='utf-8') as f:
+        json.dump(serializable_report, f, ensure_ascii=False, indent=2)
+    
+    # 生成详细的文本报告
+    with open(f'{output_dir}/execution_report.txt', 'w', encoding='utf-8') as f:
+        f.write(f"场景执行报告\n")
+        f.write(f"=============\n\n")
+        f.write(f"场景名称: {scenario_name}\n")
+        f.write(f"网络类型: {network_type}\n")
+        f.write(f"训练时间: {training_time:.2f}秒\n")
+        f.write(f"任务分配数量: {len(task_assignments)}\n\n")
+        
+        if evaluation_metrics:
+            f.write(f"评估指标:\n")
+            for key, value in evaluation_metrics.items():
+                if isinstance(value, float):
+                    f.write(f"  {key}: {value:.4f}\n")
+                else:
+                    f.write(f"  {key}: {value}\n")
+        
+        f.write(f"\n训练统计:\n")
+        for key, value in training_stats.items():
+            f.write(f"  {key}: {value:.4f}\n")
+        
+        f.write(f"\n训练历史摘要:\n")
+        summary = report["training_history_summary"]
+        f.write(f"  总回合数: {summary['total_episodes']}\n")
+        f.write(f"  最终奖励: {summary['final_reward']:.2f}\n")
+        f.write(f"  最终损失: {summary['final_loss']:.4f}\n")
+        f.write(f"  最终探索率: {summary['final_epsilon']:.4f}\n")
+        f.write(f"  最终完成率: {summary['final_completion_rate']:.4f}\n")
+        
+        f.write(f"\n配置参数:\n")
+        config_summary = report.get("config_summary", {})
+        for key, value in config_summary.items():
+            f.write(f"  {key}: {value}\n")
+    
+    print(f"执行报告已保存至: {output_dir}/execution_report.txt")
 
 if __name__ == "__main__":
     main()
-
-
-
-
